@@ -29,8 +29,8 @@ binary structure in which every string is a 1-, 2-, or 4-byte pool index.
 Declare the input form with --format; the tool never guesses from the filename
 or the bytes:
 
-  json    a single JSON value        -> JSS3 archive
-  jsonl   newline-delimited JSON     -> JSS4 archive, one shared pool
+  json    a single JSON value        -> one document
+  jsonl   newline-delimited JSON     -> one document per line, one shared pool
   ndjson  same wire form as jsonl, label preserved for round-trip
 
 Structure blocks are lz4-compressed by default, so a cold query decompresses

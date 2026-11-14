@@ -6,9 +6,9 @@ import (
 )
 
 // "l98cu" and "pvdba" both hash to 0x5304d385 under CRC-32/IEEE. They are the
-// cheapest way to exercise the branch that decides what a directory does when
-// two keys land on the same hash, which is the whole difference between the
-// JSS7 directory and the JSS8 one.
+// cheapest way to exercise what a directory does when two keys land on the
+// same hash: both are listed, and a reader settles the run against the pool
+// (specification §7A.4).
 const (
 	collidingKeyA = "l98cu"
 	collidingKeyB = "pvdba"
@@ -28,22 +28,7 @@ func TestCollidingKeysHashTheSame(t *testing.T) {
 // not collide, so one test covers the run and its neighbours.
 var collidingDoc = []byte(`{"` + collidingKeyA + `":"first","` + collidingKeyB + `":"second","plain":"third"}`)
 
-func TestJSS7DropsTheDirectoryOnACollision(t *testing.T) {
-	var buf bytes.Buffer
-	st, err := EncodeWith(collidingDoc, &buf, Options{Structure: StructDeflate, Version: 7})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.KeyDirEntries != 0 {
-		t.Errorf("JSS7 wrote %d directory entries; a collision should have emptied it", st.KeyDirEntries)
-	}
-
-	// The archive still answers correctly — it falls back to searching the pool
-	// — which is exactly what makes the loss silent.
-	assertLookups(t, buf.Bytes())
-}
-
-func TestJSS8KeepsTheDirectoryThroughACollision(t *testing.T) {
+func TestDirectoryKeepsCollidingKeys(t *testing.T) {
 	var buf bytes.Buffer
 	st, err := EncodeWith(collidingDoc, &buf, Options{Structure: StructDeflate})
 	if err != nil {

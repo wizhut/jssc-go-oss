@@ -101,17 +101,6 @@ func (s *stringSets) walk(v any, parent uint32) {
 	}
 }
 
-// distinct counts every string, whether it ends up pooled or inline.
-func (s *stringSets) distinct() int {
-	n := len(s.keys)
-	for str := range s.values {
-		if _, isKey := s.keys[str]; !isKey {
-			n++
-		}
-	}
-	return n
-}
-
 // poolPlan is the outcome of resolving the pool and its index width together.
 type poolPlan struct {
 	// keys is the key pool: every distinct object key, sorted. values is the
@@ -130,9 +119,6 @@ type poolPlan struct {
 	// paths holds the distinct root-to-leaf key path hashes, ascending. Sorted
 	// so that nothing downstream depends on map iteration order.
 	paths []uint32
-	// keyIdx is set only by the legacy (pre-JSS8) plan: the merged-pool index
-	// of every key, ascending, for the old key-directory encoding.
-	keyIdx []int
 }
 
 // buildPool resolves the string pool and the index width it is encoded with.
@@ -144,66 +130,6 @@ type poolPlan struct {
 // narrow the index, and a narrower index inlines fewer strings, this starts
 // from the width implied by every distinct string and narrows while the
 // resulting pool still fits (specification §8.8).
-// legacyBuildPool resolves the single merged pool of the pre-JSS8 layouts:
-// keys and values share one index space and one width. The golden fixtures
-// pin these bytes, so this is the old algorithm verbatim.
-func legacyBuildPool(sets *stringSets) poolPlan {
-	width := indexWidthFor(sets.distinct())
-	pool := legacyPoolAtWidth(sets, width)
-	for {
-		narrower := indexWidthFor(pool.len())
-		if narrower >= width {
-			break
-		}
-		candidate := legacyPoolAtWidth(sets, narrower)
-		if indexWidthFor(candidate.len()) > narrower {
-			break
-		}
-		pool, width = candidate, narrower
-	}
-
-	inline := 0
-	for s := range sets.values {
-		if _, pooled := pool.lookup(s); !pooled {
-			inline++
-		}
-	}
-
-	keyIdx := make([]int, 0, len(sets.keys))
-	for k := range sets.keys {
-		if i, ok := pool.lookup(k); ok {
-			keyIdx = append(keyIdx, i)
-		}
-	}
-	slices.Sort(keyIdx)
-
-	return poolPlan{keys: pool, values: pool, width: width, keyWidth: width,
-		inlineDistinct: inline, keyIdx: keyIdx, paths: sets.sortedPaths()}
-}
-
-// legacyPoolAtWidth is the merged-pool membership of the pre-JSS8 layouts.
-func legacyPoolAtWidth(sets *stringSets, width int) *stringPool {
-	members := make([]string, 0, len(sets.keys)+len(sets.values))
-	for s := range sets.keys {
-		members = append(members, s)
-	}
-	for s := range sets.values {
-		if _, isKey := sets.keys[s]; isKey {
-			continue
-		}
-		if inlinable(s, width) {
-			continue
-		}
-		members = append(members, s)
-	}
-	slices.Sort(members)
-	pool := newStringPool(len(members))
-	for _, m := range members {
-		pool.add(m)
-	}
-	return pool
-}
-
 func buildPool(sets *stringSets) poolPlan {
 	// The value pool and its width resolve together through the inline rule;
 	// the key pool needs no fixpoint — keys pool unconditionally, and the key

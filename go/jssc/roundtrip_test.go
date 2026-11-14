@@ -101,7 +101,6 @@ func TestRoundTripLayouts(t *testing.T) {
 		{"len prefix only", jssc.LayoutLenPrefix, 8},
 		{"offsets only", jssc.LayoutOffsets, 8},
 		{"both", jssc.LayoutDefault, 8},
-		{"legacy jss2", jssc.LayoutLegacy, 2},
 	}
 	for _, l := range layouts {
 		t.Run(l.name, func(t *testing.T) {
@@ -253,13 +252,14 @@ func TestEncodeRejectsBadInput(t *testing.T) {
 	}
 }
 
-func TestEncodeRejectsLegacyLayoutForLines(t *testing.T) {
-	_, _, err := jssc.EncodeToBytes([]byte(`{"a":1}`), jssc.Options{
-		Format: jssc.FormatJSONL,
-		Layout: jssc.LayoutLegacy,
-	})
-	if !errors.Is(err, jssc.ErrInvalidInput) {
-		t.Errorf("error = %v, want ErrInvalidInput", err)
+// TestEncodeRejectsLayoutBitsNotTheCallers: the path filter bit is the
+// encoder's decision (specification §7B.6), and bits 3–7 are reserved (§5.3).
+func TestEncodeRejectsLayoutBitsNotTheCallers(t *testing.T) {
+	for _, l := range []jssc.Layout{jssc.LayoutPathFilter, 0x08, 0x80} {
+		_, _, err := jssc.EncodeToBytes([]byte(`{"a":1}`), jssc.Options{Layout: l})
+		if !errors.Is(err, jssc.ErrUnsupported) {
+			t.Errorf("layout 0x%02x: error = %v, want ErrUnsupported", uint8(l), err)
+		}
 	}
 }
 
@@ -326,7 +326,6 @@ func TestConcurrencyDoesNotChangeTheArchive(t *testing.T) {
 		{"big-lz4-ndjson", events, jssc.Options{Structure: jssc.StructLZ4, Format: jssc.FormatNDJSON}},
 		{"big-fsst", big.Bytes(), jssc.Options{Algorithm: "fsst", PerEntryPool: true}},
 		{"big-group8", big.Bytes(), jssc.Options{PoolGroupShift: 3}},
-		{"big-jss4", big.Bytes(), jssc.Options{Algorithm: "fsst", Legacy4: true}},
 	} {
 		inputs = append(inputs, base)
 	}

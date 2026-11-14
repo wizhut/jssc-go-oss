@@ -39,20 +39,20 @@
 //
 // # The key hash directory
 //
-// Between the pool and the structure a JSS6 archive carries a table mapping the
-// CRC-32 of every string used as an object key to that string's pool index,
-// stored uncompressed and sorted by hash. Object members are laid out in
+// Between the pools and the structure an archive carries a table mapping the
+// CRC-32 of every object key to its key-pool index, stored uncompressed and
+// sorted by hash. Object members are laid out in
 // ascending key-index order, so a field lookup is an integer binary search over
 // the structure — and the directory supplies that integer without decompressing
 // any pool group at all. A key absent from the directory is absent from the
 // document, so a query for a field nothing has costs no pool work either.
 //
-// The encoder builds the directory only when the key hashes are distinct;
-// otherwise it writes a count of zero and readers fall back to searching the
-// pool, which is sorted and therefore costs about log2(groups)+1
-// decompressions. Options.OmitKeyDirectory suppresses the table for callers who
-// would rather have the bytes — it is a fraction of a percent of the archive on
-// most documents, and about 10% on one whose object keys are themselves data.
+// Keys whose hashes collide are all listed, and a reader settles the run by
+// comparing the key-pool strings. Options.OmitKeyDirectory writes a count of
+// zero instead, for callers who would rather have the bytes — it is a fraction
+// of a percent of the archive on most documents, and about 10% on one whose
+// object keys are themselves data; readers then search the sorted key pool,
+// which costs about log2(groups)+1 decompressions.
 //
 // # The blocked structure
 //
@@ -63,20 +63,16 @@
 // holds absolute offsets rather than lengths, so reaching document i is a single
 // four-byte read instead of a sum over every document before it.
 //
-// Through JSS6 the structure was one DEFLATE stream, which cannot be entered in
-// the middle: on a million-document archive, reading one field cost 186 ms and
-// 270 MiB and grew with the archive. Blocking makes that one block — measured at
-// 686 microseconds and 8.3 MiB — for about 3% of the archive. On documents small
+// A single DEFLATE stream cannot be entered in the middle: on a
+// million-document archive, reading one field that way cost 186 ms and 270 MiB
+// and grew with the archive. Blocking makes that one block — measured at 686
+// microseconds and 8.3 MiB — for about 3% of the archive. On documents small
 // enough to fit in a single block it costs the twelve-byte index and nothing
 // else.
 //
-// JSS1 through JSS7 are earlier revisions this package still decodes. The
-// specification is normative for JSS8 and defines JSS1–JSS7 in its appendix on
-// superseded versions, which this package must keep decoding.
-// Options.Version pins the archive version; JSS4
-// framed one pool entry per group with a uint32 length and chose offset tables
-// by child count alone, and Options.Legacy4 is the shorthand for it, as
-// Options.Layout = LayoutLegacy is for JSS2.
+// This package reads and writes JSS8 alone. The draft versions JSS1–JSS7 are
+// described in the specification's Appendix E for reference; opening one
+// returns ErrUnsupported.
 //
 // # Structure tags
 //

@@ -12,8 +12,9 @@ import (
 	"github.com/wizhut/jssc-go-oss/go/jssc"
 )
 
-// Version is the SDK release version.
-const Version = "1.0.0"
+// Version is the release version of this module, the one its git tag carries
+// (go/v<Version>). It stays below 1.0.0 while the format is a draft.
+const Version = "0.2.0"
 
 // SpecVersion is the JSSC specification revision this SDK implements.
 const SpecVersion = jssc.SpecVersion
@@ -106,22 +107,15 @@ type Options struct {
 	// no other. That is the default; set it to say so explicitly.
 	PerEntryPool bool
 
-	// Legacy4 writes the older JSS3/JSS4 encodings instead of JSS5.
-	Legacy4 bool
-
-	// Version pins the archive version. Zero selects LatestVersion. Use it to
-	// write an archive an older decoder can read.
-	Version int
-
-	// StructBlockBytes is the target plain size of one JSS7 structure block, the
+	// StructBlockBytes is the target plain size of one structure block, the
 	// unit a reader inflates to reach any document inside it. Zero selects the
-	// format default; negative stores the structure as a single block, which is
-	// what JSS6 and earlier did and what makes a cold read cost the archive.
+	// format default; negative stores the structure as a single block, which
+	// makes a cold read cost the whole structure.
 	StructBlockBytes int
 
-	// OmitKeyDirectory suppresses the JSS6 key hash directory, the table that
-	// lets a field lookup resolve its key without decompressing any pool group.
-	// The section is still written, empty, so the archive stays valid.
+	// OmitKeyDirectory suppresses the key hash directory, the table that lets a
+	// field lookup resolve its key without decompressing any pool group. The
+	// section is still written, empty, so the archive stays valid.
 	OmitKeyDirectory bool
 
 	// Concurrency bounds the goroutines the encoder uses to compress pool
@@ -151,8 +145,6 @@ func (o Options) toJSSC() jssc.Options {
 		MaxDocs:        o.MaxDocs,
 		PoolGroupShift: o.PoolGroupShift,
 		PerEntryPool:   o.PerEntryPool,
-		Legacy4:        o.Legacy4,
-		Version:        o.Version,
 
 		OmitKeyDirectory: o.OmitKeyDirectory,
 		StructBlockBytes: o.StructBlockBytes,
@@ -165,7 +157,7 @@ func ParseFormat(name string) (Format, error) {
 	return jssc.ParseContentFormat(name)
 }
 
-// ParseStructure resolves "deflate" or "raw". Empty selects deflate.
+// ParseStructure resolves "lz4", "deflate" or "raw". Empty selects lz4.
 func ParseStructure(name string) (Structure, error) {
 	return jssc.ParseStructCodec(name)
 }

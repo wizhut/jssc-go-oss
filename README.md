@@ -71,8 +71,10 @@ kept.
 The format and this implementation are a **draft** (format `JSS8`,
 specification revision 5.6.0-draft). Until a 1.0 release the wire format may
 still change, including within `JSS8`, so do not use it for archives that must
-outlive the version that wrote them. The Go implementation also reads the
-earlier development versions `JSS1`–`JSS7`, and writes only `JSS8`.
+outlive the version that wrote them. The Go implementation reads and writes
+`JSS8` only; the earlier development versions `JSS1`–`JSS7` are described in
+the specification's Appendix E for reference, and opening one returns
+`ErrUnsupported`.
 
 ## License
 

@@ -11,9 +11,9 @@ import (
 // 5.x-draft makes JSS8 the normative container — opportunistic pool groups, a
 // collision-surviving key directory, the key-path filter, lz4 structure
 // blocks cut inside documents, self-describing pool sections, and (5.3.0)
-// keys and values in separate pools with separate index widths — and defines
-// JSS1–JSS7 in a stale-by-construction appendix: readable, not writable,
-// which is why this package must keep decoding them.
+// keys and values in separate pools with separate index widths. Its appendix
+// describes the draft versions JSS1–JSS7 for reference; this package neither
+// reads nor writes them.
 //
 // 4.0.0-draft restricted the pool codec registry to small-string codecs and
 // retired ids 2 and 3; 5.4.0-draft retired unishox (id 1) on measurement,
@@ -22,46 +22,20 @@ import (
 // string read walks one 64-group segment rather than the whole pool.
 const SpecVersion = "5.6.0-draft"
 
-// Archive magic values. Every archive starts with one of these ASCII tags.
-const (
-	MagicV1 = "JSS1" // legacy: no struct_codec, no struct_layout
-	MagicV2 = "JSS2" // legacy: struct_codec, no struct_layout
-	MagicV3 = "JSS3" // single JSON document
-	MagicV4 = "JSS4" // multi-document (JSONL/NDJSON), shared pool
-	MagicV5 = "JSS5" // grouped pool, varint pool framing, adaptive offset tables
-	MagicV6 = "JSS6" // JSS5 plus the key hash directory
-	MagicV7 = "JSS7" // blocked, independently inflatable structure
-	MagicV8 = "JSS8" // opportunistic pool groups, complete key directory, path filter
-)
+// MagicV8 is the magic every archive starts with: the format version this
+// package reads and writes. The earlier draft versions JSS1–JSS7 are described
+// in the specification's Appendix E for reference only.
+const MagicV8 = "JSS8" // opportunistic pool groups, complete key directory, path filter
 
-// LatestVersion is the archive version an encoder writes unless told otherwise.
+// LatestVersion is the archive version this package reads and writes, JSS8.
 const LatestVersion = 8
 
-// Fixed header sizes, in bytes, for each archive version.
-const (
-	// magic + algo + index_width + pool_count
-	headerSizeV1 = 4 + 1 + 1 + 4
-	// magic + algo + struct_codec + index_width + pool_count
-	headerSizeV2 = 4 + 1 + 1 + 1 + 4
-	// magic + algo + struct_codec + struct_layout + index_width + pool_count
-	headerSizeV3 = 4 + 1 + 1 + 1 + 1 + 4
-	// … + content_fmt + doc_count
-	headerSizeV4 = 4 + 1 + 1 + 1 + 1 + 1 + 4 + 4
-	// … + pool_group_shift. JSS5 always carries content_fmt and doc_count, so
-	// one header shape serves both single and multi-document archives.
-	headerSizeV5 = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 4 + 4
-	// JSS6 changes nothing in the fixed header; its addition is a section.
-	headerSizeV6 = headerSizeV5
-	// JSS7 changes nothing in the fixed header either; its addition is the
-	// framing inside the structure region.
-	headerSizeV7 = headerSizeV5
-	// JSS8 (5.3.0-draft) adds key_count: the key pool and the value pool are
-	// separate index spaces, and the key width derives from this field
-	// (specification §4.1, §5.5).
-	headerSizeV8 = headerSizeV5 + 4
-)
+// headerSizeV8 is the fixed header: magic, algo, struct_codec, struct_layout,
+// index_width, content_fmt, pool_group_shift, then key_count, pool_count and
+// doc_count as uint32 (specification §4.1).
+const headerSizeV8 = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 4 + 4 + 4
 
-// Structure blocking (JSS7). The structure is compressed in independently
+// Structure blocking (specification §8A). The structure is compressed in independently
 // inflatable blocks so that reaching one document inflates one block.
 const (
 	// DefaultStructBlockBytes is the target plain size of a structure block.
@@ -77,19 +51,19 @@ const (
 	MinStructBlockBytes = 4 << 10
 )
 
-// Key hash directory (JSS6). A JSS6 archive carries, between the pool and the
-// structure, a table mapping the hash of every string used as an object key to
-// that string's pool index. A field lookup can then resolve "$.field" to an
+// Key hash directory (specification §7A). An archive carries, between the
+// pools and the structure, a table mapping the hash of every object key to its
+// key-pool index. A field lookup can then resolve "$.field" to an
 // integer without decompressing any pool group at all, and can answer "no such
 // key anywhere in this document" without touching the pool.
 const (
 	// KeyHashCRC32 identifies the hash: CRC-32 with the IEEE polynomial, the
 	// same function as hash/crc32's ChecksumIEEE.
 	//
-	// CRC-32 rather than CRC-16 because the directory is only useful if it is
-	// exact, and exactness requires the hash to be injective over the key set.
-	// Measured over real-world corpora, CRC-16 collides on 2 of 321 keys in
-	// citm_catalog and 2 of 685 in update-center; CRC-32 collides on none.
+	// CRC-32 rather than CRC-16 because every collision costs a comparison
+	// against the pool. Measured over real-world corpora, CRC-16 collides on 2
+	// of 321 keys in citm_catalog and 2 of 685 in update-center; CRC-32
+	// collides on none.
 	KeyHashCRC32 = "crc32-ieee"
 
 	// MaxKeyDirEntries bounds the directory, which is sized from a uint32 read
@@ -97,7 +71,7 @@ const (
 	MaxKeyDirEntries = math.MaxUint32
 )
 
-// Pool grouping (JSS5). Entries are compressed in groups of 1<<pool_group_shift.
+// Pool grouping (specification §5.6, §7.3). Entries are compressed in groups of 1<<pool_group_shift.
 // A group is the unit a reader must decompress to reach any entry inside it, so
 // the shift trades archive size against the cost of one cold string read.
 const (
@@ -148,15 +122,13 @@ const (
 	MaxStoredStructure = math.MaxUint32
 
 	// MinOffsetChildren is the container size at which LayoutOffsets starts
-	// emitting a child offset table.
-	//
-	// Through JSS4 this was the whole rule, and it is normative for those
-	// versions. JSS5 adds MinOffsetPayload: a table is only worth its bytes
-	// when the linear skip it replaces would traverse a meaningful amount of
-	// the document, and the median container in real JSON holds four children.
+	// emitting a child offset table, together with MinOffsetPayload: a table is
+	// only worth its bytes when the linear skip it replaces would traverse a
+	// meaningful amount of the document, and the median container in real JSON
+	// holds four children (specification §8.4).
 	MinOffsetChildren = 8
 
-	// MinOffsetPayload is the JSS5 second condition: a container carries an
+	// MinOffsetPayload is the second condition: a container carries an
 	// offset table only if its children span at least this many bytes.
 	// Measured on a GeoJSON corpus, adding it cut offset-table bytes from
 	// 23,112 to 856 by declining to index hundreds of small coordinate arrays.
@@ -166,7 +138,7 @@ const (
 	maxPoolWidth2 = 65536
 )
 
-// Offset table entry widths (JSS5). A container stores one descriptor byte
+// Offset table entry widths (specification §8.3). A container stores one descriptor byte
 // after its count saying how wide its table entries are, so a container whose
 // children span less than 256 bytes pays one byte per child instead of four.
 const (
@@ -242,7 +214,8 @@ func ParseStructCodec(name string) (StructCodec, error) {
 	}
 }
 
-// Layout is the struct_layout bitmask of walk aids stored in JSS3/JSS4 headers.
+// Layout is the struct_layout bitmask of walk aids stored in the header
+// (specification §5.3).
 type Layout uint8
 
 const (
@@ -266,15 +239,11 @@ const (
 	// per-document question the encoder answers, not a mode the caller selects.
 	LayoutDefault = LayoutLenPrefix | LayoutOffsets
 
-	// LayoutLegacy is an encoder-only flag that forces the JSS2 write path. It
-	// is never stored in an archive, and is rejected for line-oriented input.
-	LayoutLegacy Layout = 0x80
-
-	// layoutStored masks the bits that may appear in a written header through
-	// JSS7. Bits 2–6 are reserved there: writers must zero them, readers must
-	// ignore them. JSS8 claims bit 2; see header.layoutMask.
+	// layoutStored is the walk-aid bits a caller may ask for.
 	layoutStored = LayoutLenPrefix | LayoutOffsets
-	// layoutStoredV8 is layoutStored plus the bits JSS8 defines.
+	// layoutStoredV8 is every bit JSS8 defines: the walk aids and the path
+	// filter bit the encoder sets. Bits 3–7 are reserved: writers zero them,
+	// readers ignore them (specification §5.3).
 	layoutStoredV8 = layoutStored | LayoutPathFilter
 )
 
@@ -292,10 +261,7 @@ func (l Layout) String() string {
 	if l&LayoutPathFilter != 0 {
 		parts = append(parts, "pathfilter")
 	}
-	if l&LayoutLegacy != 0 {
-		parts = append(parts, "legacy")
-	}
-	if rest := l &^ (layoutStoredV8 | LayoutLegacy); rest != 0 {
+	if rest := l &^ layoutStoredV8; rest != 0 {
 		parts = append(parts, fmt.Sprintf("reserved(0x%02x)", uint8(rest)))
 	}
 	return strings.Join(parts, "+")
@@ -307,9 +273,9 @@ func (l Layout) String() string {
 type ContentFormat uint8
 
 const (
-	// FormatJSON is a single JSON value, written as a JSS3 archive.
+	// FormatJSON is a single JSON value.
 	FormatJSON ContentFormat = 0
-	// FormatJSONL is newline-delimited JSON, written as a JSS4 archive.
+	// FormatJSONL is newline-delimited JSON: one archive, one document per line.
 	FormatJSONL ContentFormat = 1
 	// FormatNDJSON has the same wire encoding as FormatJSONL; the distinct
 	// label is preserved so decompression restores the caller's chosen name.

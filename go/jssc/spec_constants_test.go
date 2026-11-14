@@ -9,10 +9,8 @@ import (
 // states appears here; a change to either side fails this rather than being
 // discovered by a reader.
 //
-// The specification is normative for JSS8 as of 5.0.0-draft, with the seven
-// superseded container versions defined in its Appendix E. The constants
-// asserted here are the current ones; the appendix's own figures are guarded by
-// TestSpecAppendixE* below, since the golden fixtures no longer cover JSS5–JSS7.
+// The specification is normative for JSS8, the only version this package reads
+// or writes; its Appendix E lists the earlier draft versions for reference.
 func TestSpecificationConstants(t *testing.T) {
 	cases := []struct {
 		spec string
@@ -33,7 +31,6 @@ func TestSpecificationConstants(t *testing.T) {
 		{"§5.3 LayoutLenPrefix", uint8(LayoutLenPrefix), uint8(0x01)},
 		{"§5.3 LayoutOffsets", uint8(LayoutOffsets), uint8(0x02)},
 		{"§5.3 LayoutPathFilter", uint8(LayoutPathFilter), uint8(0x04)},
-		{"§5.3 LayoutLegacy", uint8(LayoutLegacy), uint8(0x80)},
 		{"§5.5 index width at 256", indexWidthFor(256), 1},
 		{"§5.5 index width at 257", indexWidthFor(257), 2},
 		{"§5.5 index width at 65536", indexWidthFor(65536), 2},
@@ -72,7 +69,6 @@ func TestSpecificationConstants(t *testing.T) {
 	}
 }
 
-// Checks the header layouts documented in specification Appendix E.2.
 // defaultStructCodec resolves what the empty codec name selects — §5.2's
 // "the default an encoder writes".
 func defaultStructCodec() StructCodec {
@@ -126,49 +122,17 @@ func TestSpecWorkedExample(t *testing.T) {
 	}
 }
 
-func TestSpecAppendixEHeaderSizes(t *testing.T) {
-	want := map[int]int{1: 10, 2: 11, 3: 12, 4: 17, 5: 18, 6: 18, 7: 18, 8: 22}
-	for v, size := range want {
-		h := header{version: v, indexWidth: 1, docCount: 1}
-		if got := h.size(); got != size {
-			t.Errorf("JSS%d header size = %d, appendix says %d", v, got, size)
-		}
-		if got := len(h.marshal()); got != size {
-			t.Errorf("JSS%d marshalled to %d bytes, size() says %d", v, got, size)
-		}
+// §8.4: a table needs both MinOffsetChildren children and MinOffsetPayload
+// bytes of them.
+func TestSpecOffsetTableRule(t *testing.T) {
+	sw := &structWriter{layout: LayoutOffsets}
+	if w := sw.offsetWidth(MinOffsetChildren, MinOffsetPayload-1); w != offsetsNone {
+		t.Errorf("emitted a table below the %d-byte payload floor", MinOffsetPayload)
 	}
-}
-
-// Checks the per-version feature table in Appendix E.1.
-func TestSpecAppendixEFeatureTable(t *testing.T) {
-	for v := 1; v <= 8; v++ {
-		h := header{version: v}
-		check := func(name string, got, want bool) {
-			if got != want {
-				t.Errorf("JSS%d %s = %v, appendix says %v", v, name, got, want)
-			}
-		}
-		check("varintPool", h.varintPool(), v >= 5)
-		check("adaptiveOffsets", h.adaptiveOffsets(), v >= 5)
-		check("keyDir", h.keyDir(), v >= 6)
-		check("blockedStructure", h.blockedStructure(), v >= 7)
-		check("rootOffsets", h.rootOffsets(), v >= 7)
-		check("opportunisticPool", h.opportunisticPool(), v >= 8)
-		check("completeKeyDirectory", h.completeKeyDirectory(), v >= 8)
+	if w := sw.offsetWidth(MinOffsetChildren-1, 1<<20); w != offsetsNone {
+		t.Errorf("emitted a table below %d children", MinOffsetChildren)
 	}
-}
-
-// Appendix E.6: pre-JSS5 offset tables are uint32 and use child count alone.
-func TestSpecAppendixEOffsetTables(t *testing.T) {
-	legacy := &structWriter{layout: LayoutOffsets, adaptiveOffsets: false}
-	if w := legacy.offsetWidth(MinOffsetChildren, 1); w != 4 {
-		t.Errorf("pre-JSS5 table width = %d, appendix says uint32", w)
-	}
-	if w := legacy.offsetWidth(MinOffsetChildren-1, 1<<20); w != offsetsNone {
-		t.Errorf("pre-JSS5 emitted a table below %d children", MinOffsetChildren)
-	}
-	modern := &structWriter{layout: LayoutOffsets, adaptiveOffsets: true}
-	if w := modern.offsetWidth(MinOffsetChildren, MinOffsetPayload-1); w != offsetsNone {
-		t.Errorf("JSS5+ emitted a table below the %d-byte payload floor", MinOffsetPayload)
+	if w := sw.offsetWidth(MinOffsetChildren, MinOffsetPayload); w != 2 {
+		t.Errorf("table width at a %d-byte span = %d, want 2", MinOffsetPayload, w)
 	}
 }

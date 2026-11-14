@@ -148,10 +148,8 @@ func TestGroupDirectoryRejectsABadEntry(t *testing.T) {
 }
 
 // Every path that reads every string — warming, materializing — agrees with
-// the source across many segments, at JSS8 with a directory and at the
-// versions without one, where the first read finds the segments by walking.
-// JSS4 is the uint32-framed case; it is written from NDJSON, the form its
-// golden fixture takes, and read back as the virtual root array.
+// the source across many segments, as a single document and as NDJSON read
+// back as the virtual root array.
 func TestGroupDirectoryFullDecode(t *testing.T) {
 	src := stringArray(3200)
 	var lines bytes.Buffer
@@ -162,22 +160,21 @@ func TestGroupDirectoryFullDecode(t *testing.T) {
 	if err := json.Unmarshal(src, &want); err != nil {
 		t.Fatal(err)
 	}
-	for _, v := range []int{0, 7, 4} {
-		t.Run(fmt.Sprintf("version %d", v), func(t *testing.T) {
-			opt, in := Options{Version: v}, src
-			if v == 4 {
-				opt.Structure, opt.Format, in = StructDeflate, FormatNDJSON, lines.Bytes()
-			}
-			archive := encodeForTest(t, in, opt)
+	for _, tc := range []struct {
+		name    string
+		archive []byte
+	}{
+		{"json", encodeForTest(t, src, Options{})},
+		{"ndjson", encodeForTest(t, lines.Bytes(), Options{Format: FormatNDJSON, Structure: StructDeflate})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			archive := tc.archive
 			a, err := OpenBytes(archive)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if (a.vals.dir >= 0) != (v == 0) {
-				t.Fatalf("group directory present = %v at version %d", a.vals.dir >= 0, v)
-			}
-			// A point read first, so the no-directory versions find their
-			// segments by walking before anything else has.
+			// A point read first, so it finds its segment through the
+			// directory before anything else has walked one.
 			if got, err := a.QueryValues("$[3199]"); err != nil || len(got) != 1 || got[0] != "value-03199" {
 				t.Fatalf("got %v, %v", got, err)
 			}

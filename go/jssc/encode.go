@@ -71,67 +71,26 @@ func encodeDocs(w io.Writer, opt Options, docs []any, sets *stringSets, rawBytes
 		return nil, errInvalidf("empty input")
 	}
 
+	layout := opt.layout()
 	h := header{
-		version:    opt.writeVersion(),
+		layout:     layout,
 		contentFmt: opt.Format,
 		docCount:   uint32(len(docs)),
 		groupShift: opt.poolGroupShift(),
 	}
-	// JSS1 and JSS2 have no struct_layout byte, and a reader implies no walk
-	// aids (Appendix E), so none are written — whether LayoutLegacy or a
-	// Version pin chose the version.
-	layout := opt.layout()
-	if h.version < 3 {
-		layout = 0
-	}
-	h.layout = layout
-	if h.version < 5 {
-		// Earlier versions frame one entry per group and have no group field.
-		h.groupShift = 0
-	}
 
-	// The plan follows the version: JSS8 splits keys and values into separate
-	// pools with separate index spaces (specification §7); the earlier
-	// layouts share one pool, and their golden fixtures pin those bytes.
-	var plan poolPlan
-	if h.splitPools() {
-		plan = buildPool(sets)
-	} else {
-		plan = legacyBuildPool(sets)
-	}
+	// Keys and values go into separate pools with separate index spaces
+	// (specification §7).
+	plan := buildPool(sets)
 	if plan.values.len() > MaxPoolCount || plan.keys.len() > MaxPoolCount {
 		return nil, errLimitf("pool holds %d strings (max %d)",
 			max(plan.values.len(), plan.keys.len()), MaxPoolCount)
 	}
 	h.indexWidth = plan.width
 	h.poolCount = uint32(plan.values.len())
-	if h.splitPools() {
-		h.keyCount = uint32(plan.keys.len())
-	}
+	h.keyCount = uint32(plan.keys.len())
 
-	// The key hash directory is a JSS6 section. An encoder that declines to
-	// build one still writes the count, so the section is not optional on the
-	// wire — only its contents are (specification §7A).
-	keyDir := emptyKeyDirectory
-	keyDirEntries := 0
-	if h.keyDir() && !opt.OmitKeyDirectory {
-		var enc []byte
-		var ok bool
-		if h.splitPools() {
-			enc, ok = buildSplitKeyDirectory(plan.keys, plan.keyWidth)
-		} else {
-			enc, ok = buildKeyDirectory(plan.keys, plan.keyIdx, plan.width, h.completeKeyDirectory())
-		}
-		if ok {
-			keyDir, keyDirEntries = enc, plan.keys.len()
-			if !h.splitPools() {
-				keyDirEntries = len(plan.keyIdx)
-			}
-		}
-	}
-	if !h.keyDir() {
-		keyDir = nil
-	}
+	keyDir, keyDirEntries := keyDirectorySection(plan, opt)
 
 	c, keySec, pool, err := buildPoolSections(opt.Algorithm, plan, h, opt.concurrency())
 	if err != nil {
@@ -139,76 +98,45 @@ func encodeDocs(w io.Writer, opt Options, docs []any, sets *stringSets, rawBytes
 	}
 
 	sw := &structWriter{
-		values:          plan.values,
-		keys:            plan.keys,
-		width:           plan.width,
-		keyWidth:        plan.keyWidth,
-		layout:          layout,
-		maxDepth:        opt.maxDepth(),
-		adaptiveOffsets: h.adaptiveOffsets(),
+		values:   plan.values,
+		keys:     plan.keys,
+		width:    plan.width,
+		keyWidth: plan.keyWidth,
+		layout:   layout,
+		maxDepth: opt.maxDepth(),
 	}
 
-	// Every archive from JSS4 on carries the root table, a single JSON document
-	// included (Appendix E; 1.0.0-draft §5.2), so one structure layout serves
-	// both cases at a cost of four bytes. JSS1–JSS3 have no table and hold one
-	// document; validate refuses line-oriented input pinned to them.
-	var plain []byte
-	var docStarts []int
-	if h.version >= 4 {
-		// The structure is a table of per-document roots followed by the roots,
-		// so document i can be opened without scanning 0..i-1 (specification
-		// §5.2). Through JSS6 the table holds lengths; JSS7 holds absolute
-		// offsets, which is what makes reaching document i a single read.
-		var body bytes.Buffer
-		lengths := make([]uint32, len(docs))
-		starts := make([]int, len(docs))
-		base := 4 * len(docs)
-		for i, doc := range docs {
-			start := body.Len()
-			if err := sw.writeValue(&body, doc); err != nil {
-				return nil, err
-			}
-			n := body.Len() - start
-			if n > math.MaxUint32 {
-				return nil, errLimitf("document %d root exceeds uint32 bytes", i)
-			}
-			lengths[i] = uint32(n)
-			starts[i] = base + start
-		}
-		var structBuf bytes.Buffer
-		structBuf.Grow(4*len(lengths) + body.Len())
-		for i, n := range lengths {
-			if h.rootOffsets() {
-				if starts[i] > math.MaxUint32 {
-					return nil, errLimitf("document %d starts past uint32 bytes", i)
-				}
-				writeUint32(&structBuf, uint32(starts[i]))
-			} else {
-				writeUint32(&structBuf, n)
-			}
-		}
-		structBuf.Write(body.Bytes())
-		plain = structBuf.Bytes()
-		docStarts = starts
-	} else {
-		var structBuf bytes.Buffer
-		if err := sw.writeValue(&structBuf, docs[0]); err != nil {
+	// The structure is a table of root offsets followed by the roots, a single
+	// JSON document included, so document i opens with one read
+	// (specification §4.2, §8A.4).
+	var body bytes.Buffer
+	docStarts := make([]int, len(docs))
+	base := 4 * len(docs)
+	for i, doc := range docs {
+		start := body.Len()
+		if err := sw.writeValue(&body, doc); err != nil {
 			return nil, err
 		}
-		plain = structBuf.Bytes()
+		if body.Len()-start > math.MaxUint32 {
+			return nil, errLimitf("document %d root exceeds uint32 bytes", i)
+		}
+		docStarts[i] = base + start
 	}
+	var structBuf bytes.Buffer
+	structBuf.Grow(base + body.Len())
+	for i, start := range docStarts {
+		if start > math.MaxUint32 {
+			return nil, errLimitf("document %d starts past uint32 bytes", i)
+		}
+		writeUint32(&structBuf, uint32(start))
+	}
+	structBuf.Write(body.Bytes())
+	plain := structBuf.Bytes()
 
-	var stored []byte
-	var structCodec StructCodec
-	structBlocks := 1
-	if h.blockedStructure() {
-		plan := planStructBlocks(len(plain), opt.structBlockBytes(), 4*len(docStarts), docStarts,
-			opt.Structure != StructRaw)
-		structBlocks = len(plan.cuts) - 1
-		stored, structCodec, err = packStructBlocks(plain, plan, opt.Structure, opt.concurrency())
-	} else {
-		stored, structCodec, err = packStructure(plain, opt.Structure)
-	}
+	blockPlan := planStructBlocks(len(plain), opt.structBlockBytes(), base, docStarts,
+		opt.Structure != StructRaw)
+	structBlocks := len(blockPlan.cuts) - 1
+	stored, structCodec, err := packStructBlocks(plain, blockPlan, opt.Structure, opt.concurrency())
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +156,7 @@ func encodeDocs(w io.Writer, opt Options, docs []any, sets *stringSets, rawBytes
 	// only when it is small beside the pool and structure it saves a walk
 	// through, and neither of those sizes is known until here. The layout bit
 	// is what announces it, so a reader that finds the bit clear never looks.
-	pathFilter := pathFilterSection(h, opt, plan.paths, pool.payload+len(stored))
+	pathFilter := pathFilterSection(opt, plan.paths, pool.payload+len(stored))
 	if len(pathFilter) > 0 {
 		h.layout |= LayoutPathFilter
 	}
@@ -242,7 +170,7 @@ func encodeDocs(w io.Writer, opt Options, docs []any, sets *stringSets, rawBytes
 		StructCodec:   structCodec,
 		StructLayout:  h.layout,
 		ContentFormat: opt.Format,
-		Version:       h.version,
+		Version:       LatestVersion,
 		DocCount:      len(docs),
 		IndexWidth:    plan.width,
 		KeyWidth:      plan.keyWidth,
@@ -278,10 +206,20 @@ func encodeDocs(w io.Writer, opt Options, docs []any, sets *stringSets, rawBytes
 	return st, nil
 }
 
-// pathFilterSection builds the JSS8 key-path filter, or nil when this archive
-// should not carry one.
-func pathFilterSection(h header, opt Options, paths []uint32, indexedBytes int) []byte {
-	if h.version < 8 || opt.OmitPathFilter {
+// keyDirectorySection builds the key hash directory over every key. An encoder
+// that declines to build one still writes the count, so the section is not
+// optional on the wire, only its contents are (specification §7A.5).
+func keyDirectorySection(plan poolPlan, opt Options) (section []byte, entries int) {
+	if opt.OmitKeyDirectory {
+		return emptyKeyDirectory, 0
+	}
+	return buildKeyDirectory(plan.keys, plan.keyWidth), plan.keys.len()
+}
+
+// pathFilterSection builds the key-path filter, or nil when this archive
+// should not carry one (specification §7B.6).
+func pathFilterSection(opt Options, paths []uint32, indexedBytes int) []byte {
+	if opt.OmitPathFilter {
 		return nil
 	}
 	f := buildPathFilter(paths)
@@ -306,54 +244,41 @@ type builtPool struct {
 	section  []byte // framing and payload, ready to write
 	payload  int    // stored bytes, framing excluded
 	rawBytes int    // the strings before compression
-	// rawGroups counts the groups JSS8 stored uncompressed because compressing
-	// them did not help. It is reported so a corpus can say how often the
+	// rawGroups counts the groups stored uncompressed because compressing them
+	// did not help. It is reported so a corpus can say how often the
 	// opportunistic rule fired rather than leaving it to be inferred.
 	rawGroups int
 }
 
 // buildPoolSections instantiates the named codec, trains it on every pooled
-// string — both pools together, so one symbol table serves keys and values —
-// and compresses each pool into its own section. Before the split, keySection
-// is nil and the single merged pool is the value section.
+// string — both pools together, so one symbol table serves keys and values
+// (specification §6.1) — and compresses each pool into its own section.
 func buildPoolSections(algoName string, plan poolPlan, h header, concurrency int) (codec.Codec, []byte, *builtPool, error) {
 	c, err := codec.NewByName(algoName)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	samples := plan.values.samples()
-	if h.splitPools() {
-		samples = append(append([][]byte{}, plan.keys.samples()...), plan.values.samples()...)
-	}
+	samples := append(append([][]byte{}, plan.keys.samples()...), plan.values.samples()...)
 	if err := c.Train(samples); err != nil {
 		return nil, nil, nil, errInvalidf("train %s: %v", c.Name(), err)
 	}
 
-	var keySection []byte
-	if h.splitPools() {
-		ks, kPayload, kRaw, err := encodePool(c, plan.keys.strings(), h.groupShift,
-			h.varintPool(), h.opportunisticPool(), h.groupDirectory(), concurrency)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		keySection, err = framePoolSection(ks)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		_ = kPayload
-		_ = kRaw
-	}
-
-	section, payload, rawGroups, err := encodePool(c, plan.values.strings(), h.groupShift,
-		h.varintPool(), h.opportunisticPool(), h.groupDirectory(), concurrency)
+	ks, _, _, err := encodePool(c, plan.keys.strings(), h.groupShift, concurrency)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if h.poolSectionLength() {
-		section, err = framePoolSection(section)
-		if err != nil {
-			return nil, nil, nil, err
-		}
+	keySection, err := framePoolSection(ks)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	section, payload, rawGroups, err := encodePool(c, plan.values.strings(), h.groupShift, concurrency)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	section, err = framePoolSection(section)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	out := &builtPool{section: section, payload: payload, rawGroups: rawGroups}
@@ -361,9 +286,7 @@ func buildPoolSections(algoName string, plan poolPlan, h header, concurrency int
 		out.rawBytes += len(s)
 	}
 	for _, s := range plan.keys.strings() {
-		if h.splitPools() {
-			out.rawBytes += len(s)
-		}
+		out.rawBytes += len(s)
 	}
 	return c, keySection, out, nil
 }
@@ -381,8 +304,9 @@ func framePoolSection(section []byte) ([]byte, error) {
 	return framed, nil
 }
 
-// writeArchive emits header, codec state, the key pool section (JSS8), the
-// value pool section, and the structure block, in that order.
+// writeArchive emits the sections in the order of specification §4.1: header,
+// codec state, key pool, value pool, key directory, path filter, struct_len
+// and the structure.
 func writeArchive(w io.Writer, h header, state, keyPool, pool, keyDir, pathFilter, structure []byte) error {
 	if err := h.writeTo(w); err != nil {
 		return err
@@ -455,35 +379,6 @@ func lz4Block(plain []byte) ([]byte, error) {
 	return dst[:n], nil
 }
 
-// packStructure applies the structure codec. Deflate is abandoned when it would
-// not shrink the block, so the header always describes the bytes that follow
-// (specification §5.2). Only the unblocked pre-JSS7 write paths come here, and
-// lz4 postdates them (specification §5.2), which validate has already ruled
-// out.
-func packStructure(plain []byte, sc StructCodec) ([]byte, StructCodec, error) {
-	if sc == StructRaw {
-		return plain, StructRaw, nil
-	}
-	if sc != StructDeflate {
-		return nil, 0, errUnsupportedf("structure codec %s in an unblocked structure", sc)
-	}
-	var out bytes.Buffer
-	zw, err := flate.NewWriter(&out, flate.BestCompression)
-	if err != nil {
-		return nil, 0, errInvalidf("deflate structure: %v", err)
-	}
-	if _, err := zw.Write(plain); err != nil {
-		return nil, 0, errInvalidf("deflate structure: %v", err)
-	}
-	if err := zw.Close(); err != nil {
-		return nil, 0, errInvalidf("deflate structure: %v", err)
-	}
-	if out.Len() >= len(plain) {
-		return plain, StructRaw, nil
-	}
-	return out.Bytes(), StructDeflate, nil
-}
-
 // structWriter serializes value trees against a fixed pool, tallying the string
 // values it writes inline.
 type structWriter struct {
@@ -495,9 +390,6 @@ type structWriter struct {
 	keyWidth int
 	layout   Layout
 	maxDepth int
-	// adaptiveOffsets selects the JSS5 container encoding: a width descriptor
-	// byte, a payload condition, and variable-width table entries.
-	adaptiveOffsets bool
 
 	inlineRefs       int
 	inlineBytes      int
@@ -643,11 +535,11 @@ func (sw *structWriter) writeContainer(w *bytes.Buffer, tag byte, count int, off
 	writeUint32(w, uint32(count))
 
 	width := sw.offsetWidth(count, len(body))
-	if sw.adaptiveOffsets && sw.layout&LayoutOffsets != 0 {
-		// JSS5 states the table width per container, so a reader knows what to
-		// step over without recomputing the encoder's decision. The descriptor
-		// only exists when the layout asked for tables at all — otherwise there
-		// is no decision to record and the reader is not looking for one.
+	if sw.layout&LayoutOffsets != 0 {
+		// The table width is stated per container, so a reader knows what to
+		// step over without recomputing the encoder's decision (specification
+		// §8.3). The descriptor only exists when the layout asked for tables at
+		// all — otherwise there is no decision to record.
 		w.WriteByte(uint8(width))
 	}
 	if width != offsetsNone {
@@ -663,18 +555,15 @@ func (sw *structWriter) writeContainer(w *bytes.Buffer, tag byte, count int, off
 }
 
 // offsetWidth decides whether a container carries an offset table, and how wide
-// its entries are.
+// its entries are (specification §8.4).
 //
-// Through JSS4 the rule is child count alone. JSS5 adds the payload condition,
-// because the table replaces a linear skip whose cost is what the children
-// occupy: indexing eight three-element coordinate arrays costs more bytes than
-// the scan it saves. Entry width then follows the span the offsets must reach.
+// The payload condition is there because the table replaces a linear skip
+// whose cost is what the children occupy: indexing eight three-element
+// coordinate arrays costs more bytes than the scan it saves. Entry width then
+// follows the span the offsets must reach.
 func (sw *structWriter) offsetWidth(count, span int) int {
 	if sw.layout&LayoutOffsets == 0 || count < MinOffsetChildren {
 		return offsetsNone
-	}
-	if !sw.adaptiveOffsets {
-		return 4
 	}
 	if span < MinOffsetPayload {
 		return offsetsNone

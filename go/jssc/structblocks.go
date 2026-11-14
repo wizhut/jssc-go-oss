@@ -11,16 +11,15 @@ import (
 	lz4 "github.com/pierrec/lz4/v4"
 )
 
-// The blocked structure (JSS7, specification §8A).
+// The blocked structure (specification §8A).
 //
-// Through JSS6 the structure was one DEFLATE stream. A stream cannot be entered
-// in the middle, so reaching document i meant inflating every document before
-// it: measured on a million-row archive, 186 ms and 270 MiB of resident memory
-// to read one field, growing without bound. The pool had already been given
-// this treatment in JSS5 and the structure had not.
+// A structure stored as one DEFLATE stream cannot be entered in the middle, so
+// reaching document i means inflating every document before it: measured on a
+// million-row archive, 186 ms and 270 MiB of resident memory to read one field,
+// growing without bound.
 //
-// JSS7 compresses the structure in independently inflatable blocks with an
-// index, so reaching a document inflates one block. Blocks are cut at document
+// The structure is therefore compressed in independently inflatable blocks with
+// an index, so reaching a document inflates one block. Blocks are cut at document
 // boundaries and never split a document — a document larger than the target
 // becomes an oversized block of its own — which is what keeps every read inside
 // a walk zero-copy, since a walk never leaves the document it entered.
@@ -31,10 +30,6 @@ import (
 // structBlocks gives byte-addressed access to a structure that is stored as
 // independently compressed blocks, inflating a block the first time something
 // reads inside it.
-//
-// A version before JSS7 has exactly one block covering the whole structure, so
-// every reader goes through the same path and the old behaviour is what a
-// single block does.
 type structBlocks struct {
 	stored []byte      // the whole stored structure region, not copied
 	codec  StructCodec //
@@ -42,8 +37,7 @@ type structBlocks struct {
 	total  int      // plain bytes across every block
 	cache  [][]byte // inflated blocks, nil until touched
 
-	// maxPlain bounds what one block may inflate to, mirroring the whole-block
-	// limit of earlier versions (specification §14).
+	// maxPlain bounds what the blocks may inflate to (specification §14).
 	maxPlain int64
 
 	// InflatedBlocks counts how many blocks have been inflated. It is what makes
@@ -69,7 +63,7 @@ type blockSpan struct {
 	plainOff, plainLen   int
 }
 
-// newStructBlocks parses a JSS7 structure region: a block count, a table of
+// newStructBlocks parses a structure region (specification §8A.2): a block count, a table of
 // per-block stored and plain lengths, then the blocks themselves.
 func newStructBlocks(stored []byte, sc StructCodec, maxPlain int64) (*structBlocks, error) {
 	if len(stored) < 4 {
@@ -108,16 +102,6 @@ func newStructBlocks(stored []byte, sc StructCodec, maxPlain int64) (*structBloc
 		}
 	}
 	return sb, nil
-}
-
-// newSingleBlock wraps an already-plain structure as one block, which is what
-// every version before JSS7 has.
-func newSingleBlock(plain []byte) *structBlocks {
-	return &structBlocks{
-		blocks: []blockSpan{{plainLen: len(plain)}},
-		cache:  [][]byte{plain},
-		total:  len(plain),
-	}
 }
 
 func (s *structBlocks) len() int { return s.total }

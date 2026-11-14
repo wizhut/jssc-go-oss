@@ -59,17 +59,15 @@ func InspectFrom(r io.Reader) (*Stats, error) {
 	return Inspect(raw)
 }
 
-// IsArchive reports whether raw begins with a known JSSC magic.
+// IsArchive reports whether raw begins with a JSSC magic: JSS8, or one of the
+// draft versions JSS1–JSS7, which are recognised so that a caller routes them
+// to Open and gets ErrUnsupported rather than a JSON parse error.
 func IsArchive(raw []byte) bool {
 	if len(raw) < 4 {
 		return false
 	}
-	switch string(raw[:4]) {
-	case MagicV1, MagicV2, MagicV3, MagicV4, MagicV5, MagicV6, MagicV7, MagicV8:
-		return true
-	default:
-		return false
-	}
+	m := string(raw[:4])
+	return m == MagicV8 || earlierMagic(m)
 }
 
 // EncodeToBytes is a convenience wrapper around EncodeWith that returns the

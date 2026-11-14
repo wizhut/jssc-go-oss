@@ -71,7 +71,6 @@ func FuzzOpen(f *testing.F) {
 	for _, opt := range []jssc.Options{
 		{Structure: jssc.StructRaw},
 		{Structure: jssc.StructDeflate},
-		{Structure: jssc.StructRaw, Layout: jssc.LayoutLegacy},
 	} {
 		archive, _, err := jssc.EncodeToBytes([]byte(`{"users":[{"name":"Alice","role":"admin"}]}`), opt)
 		if err != nil {

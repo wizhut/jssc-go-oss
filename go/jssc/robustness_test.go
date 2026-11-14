@@ -26,7 +26,8 @@ func TestOpenRejectsBadMagic(t *testing.T) {
 		{"short", []byte("JS"), jssc.ErrTruncated},
 		{"wrong magic", []byte("XXXXxxxxxxxxxxxx"), jssc.ErrBadMagic},
 		{"future magic", []byte("JSS9xxxxxxxxxxxx"), jssc.ErrBadMagic},
-		{"magic only", []byte("JSS3"), jssc.ErrTruncated},
+		{"magic only", []byte("JSS8"), jssc.ErrTruncated},
+		{"earlier version", []byte("JSS3xxxxxxxxxxxx"), jssc.ErrUnsupported},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

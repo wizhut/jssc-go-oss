@@ -17,7 +17,7 @@ import (
 // table is computed from the lengths alone, and lengths can claim one.
 func TestStreamingRootOffsetsStopAtUint32(t *testing.T) {
 	scratch := t.TempDir()
-	t.Setenv("TMPDIR", scratch) // where concatLengthsAndBody creates its file
+	t.Setenv("TMPDIR", scratch) // where concatOffsetsAndBody creates its file
 
 	body := filepath.Join(t.TempDir(), "body")
 	if err := os.WriteFile(body, []byte{0x01, 0x02}, 0o644); err != nil {
@@ -26,7 +26,7 @@ func TestStreamingRootOffsetsStopAtUint32(t *testing.T) {
 
 	// Two documents: the table is 8 bytes, so the second root starts at
 	// 8 + the first length. Here it lands exactly on the largest offset.
-	path, size, err := concatLengthsAndBody(body, []uint32{math.MaxUint32 - 8, 2}, true)
+	path, size, err := concatOffsetsAndBody(body, []uint32{math.MaxUint32 - 8, 2})
 	if err != nil {
 		t.Fatalf("offset at math.MaxUint32: %v", err)
 	}
@@ -48,18 +48,10 @@ func TestStreamingRootOffsetsStopAtUint32(t *testing.T) {
 	// One byte more and the second root starts at 2^32, which would have been
 	// written as 0.
 	over := []uint32{math.MaxUint32 - 7, 2}
-	if _, _, err := concatLengthsAndBody(body, over, true); !errors.Is(err, ErrLimitExceeded) {
+	if _, _, err := concatOffsetsAndBody(body, over); !errors.Is(err, ErrLimitExceeded) {
 		t.Fatalf("offset at 2^32: error = %v, want ErrLimitExceeded", err)
 	}
 	if left, _ := os.ReadDir(scratch); len(left) != 0 {
 		t.Errorf("a failed table left %d file(s) behind: %v", len(left), left)
 	}
-
-	// A JSS5/JSS6 table holds the lengths themselves, each of which fits, so
-	// the same documents are representable there.
-	path, _, err = concatLengthsAndBody(body, over, false)
-	if err != nil {
-		t.Fatalf("length table: %v", err)
-	}
-	os.Remove(path)
 }

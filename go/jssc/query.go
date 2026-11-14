@@ -395,7 +395,7 @@ func (a *Archive) evalChild(pos int, key string, rest, path jp.Expr, out *[]Matc
 
 	// Object keys are always pooled, so a key that is not in the pool names
 	// nothing in this archive and the whole subtree can be dismissed without
-	// reading a single member. With a JSS6 key directory that verdict costs one
+	// reading a single member. With a key directory that verdict costs one
 	// hash and a binary search over a flat array — no pool group is touched.
 	target, found, err := a.lookupFieldIndex(key)
 	if err != nil {

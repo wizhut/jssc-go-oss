@@ -75,11 +75,11 @@ func (a *Archive) valueEndPos(pos int) (int, error) {
 		}
 		return end, nil
 	}
-	return skipTagged(a.structure, pos, a.indexWidth, a.keyWidth, a.layoutOffsets, a.adaptiveOffsets, a.limits.maxDepth())
+	return skipTagged(a.structure, pos, a.indexWidth, a.keyWidth, a.layoutOffsets, a.limits.maxDepth())
 }
 
 // skipTagged walks past a bare tagged value at pos (no length prefix).
-func skipTagged(sb *structBlocks, pos, indexWidth, keyWidth int, layoutOffsets, adaptive bool, depth int) (int, error) {
+func skipTagged(sb *structBlocks, pos, indexWidth, keyWidth int, layoutOffsets bool, depth int) (int, error) {
 	if depth <= 0 {
 		return 0, errLimitf("nesting deeper than the decode limit")
 	}
@@ -107,7 +107,7 @@ func skipTagged(sb *structBlocks, pos, indexWidth, keyWidth int, layoutOffsets, 
 		_, next, err := readIndex(sb, pos, indexWidth)
 		return next, err
 	case tagArray, tagObject:
-		count, next, err := readContainerCount(sb, pos, sb.len(), layoutOffsets, adaptive)
+		count, next, err := readContainerCount(sb, pos, sb.len(), layoutOffsets)
 		if err != nil {
 			return 0, err
 		}
@@ -120,7 +120,7 @@ func skipTagged(sb *structBlocks, pos, indexWidth, keyWidth int, layoutOffsets, 
 				}
 				pos = valPos
 			}
-			pos, err = skipTagged(sb, pos, indexWidth, keyWidth, layoutOffsets, adaptive, depth-1)
+			pos, err = skipTagged(sb, pos, indexWidth, keyWidth, layoutOffsets, depth-1)
 			if err != nil {
 				return 0, err
 			}
@@ -140,7 +140,7 @@ func skipTagged(sb *structBlocks, pos, indexWidth, keyWidth int, layoutOffsets, 
 
 // readContainerCount reads a container's element count at pos (just past the
 // tag) and returns the offset of its first child, skipping any offset table.
-func readContainerCount(sb *structBlocks, pos, limit int, layoutOffsets, adaptive bool) (count, childStart int, err error) {
+func readContainerCount(sb *structBlocks, pos, limit int, layoutOffsets bool) (count, childStart int, err error) {
 	if pos+4 > limit {
 		return 0, 0, errTruncatedf("container count at %d", pos)
 	}
@@ -150,7 +150,7 @@ func readContainerCount(sb *structBlocks, pos, limit int, layoutOffsets, adaptiv
 	}
 	pos += 4
 
-	width, pos, err := readOffsetWidth(sb, pos, int(n), layoutOffsets, adaptive)
+	width, pos, err := readOffsetWidth(sb, pos, layoutOffsets)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -168,21 +168,13 @@ func readContainerCount(sb *structBlocks, pos, limit int, layoutOffsets, adaptiv
 	return int(n), pos, nil
 }
 
-// readOffsetWidth resolves a container's offset-table entry width and returns
-// the position just past the descriptor byte, if the version has one.
-//
-// Through JSS4 the presence and width of a table are implied by the child count
-// alone. JSS5 stores a descriptor, because the encoder's decision now depends on
-// the payload size too — something a reader cannot recompute without doing the
-// walk the table exists to avoid.
-func readOffsetWidth(sb *structBlocks, pos, count int, layoutOffsets, adaptive bool) (width, next int, err error) {
+// readOffsetWidth reads a container's offset-width descriptor and returns the
+// position just past it. The descriptor exists whenever the layout carries
+// offset tables, because the encoder's decision depends on the payload size —
+// something a reader cannot recompute without doing the walk the table exists
+// to avoid (specification §8.3, §8.4).
+func readOffsetWidth(sb *structBlocks, pos int, layoutOffsets bool) (width, next int, err error) {
 	if !layoutOffsets {
-		return offsetsNone, pos, nil
-	}
-	if !adaptive {
-		if count >= MinOffsetChildren {
-			return 4, pos, nil
-		}
 		return offsetsNone, pos, nil
 	}
 	w, err := sb.byteAt(pos)
@@ -281,7 +273,7 @@ func (a *Archive) containerMetaAt(pos int) (containerMeta, error) {
 	}
 	m.count = int(count)
 
-	width, p, err := readOffsetWidth(a.structure, p, m.count, a.layoutOffsets, a.adaptiveOffsets)
+	width, p, err := readOffsetWidth(a.structure, p, a.layoutOffsets)
 	if err != nil {
 		return m, err
 	}

@@ -125,8 +125,9 @@ interpreted as described in [RFC2119].
   encoder under this document.
 - A **conformant encoder** MUST produce archives that a conformant decoder
   restores to an equivalent JSON value under Section 13.
-- An implementation MAY also read archives of the earlier versions `JSS1`
-  through `JSS7` (Appendix E). Writing them is forbidden.
+- Archives of the earlier draft versions `JSS1` through `JSS7` (Appendix E)
+  are not part of this format: a decoder rejects them (4.1) and an encoder
+  MUST NOT write them.
 
 ### 1.6. Document Status
 
@@ -1446,7 +1447,7 @@ Seven container versions, `JSS1` through `JSS7`, preceded this one during the
 format's development. They differ in framing details: pool group framing with
 fixed-width lengths, no stored pool lengths, no group directory, a single shared
 pool for keys and values, a structure compressed as one stream, and a key
-directory that was suppressed on any hash collision. An implementation MAY read
-them; the reference decoder does, and its golden fixtures cover several. Their
-layouts are not part of this document, and no encoder conforming to it produces
-them.
+directory that was suppressed on any hash collision. They are listed here for
+reference only: their layouts are not part of this document, a conformant
+decoder rejects them (4.1), no conformant encoder produces them, and the
+reference implementation neither reads nor writes them.

@@ -6,7 +6,7 @@ import (
 	"slices"
 )
 
-// The key hash directory (JSS6, specification §7A).
+// The key hash directory (specification §7A).
 //
 // The pool is sorted lexicographically, so finding a string's index means a
 // binary search that decompresses about log2(groups)+1 groups. That is cheap,
@@ -66,14 +66,12 @@ func (d keyDirectory) indexAt(i int) int {
 
 // candidates returns the half-open range of directory entries whose hash is h.
 //
-// Through JSS7 the range is never longer than one: the encoder declined to write
-// a directory at all rather than emit a colliding pair, so a hit was exact. JSS8
-// keeps the directory and lets the run be longer, which is why callers ask for a
-// range rather than an index — the common case is still exactly one entry, and
-// costs the same binary search.
+// Colliding keys are all listed, so the run can be longer than one, which is
+// why callers ask for a range rather than an index — the common case is still
+// exactly one entry, and costs the same binary search (specification §7A.4).
 //
-// An empty range is a definitive miss in every version: the directory lists
-// every key in the document, so a hash that is not in it belongs to no key.
+// An empty range is a definitive miss: the directory lists every key in the
+// document, so a hash that is not in it belongs to no key.
 func (d keyDirectory) candidates(h uint32) (lo, hi int) {
 	lo = 0
 	hi = d.count
@@ -106,45 +104,18 @@ func (d keyDirectory) lookup(h uint32) (int, bool) {
 	return d.indexAt(lo), true
 }
 
-// buildKeyDirectory encodes the directory for the given key indices.
-//
-// Entries are emitted in ascending (hash, pool index) order, which keeps the
-// archive deterministic.
-//
-// Collisions are the difference between the two forms:
-//
-//   - JSS6 and JSS7 (tolerant=false): two keys sharing a hash makes the whole
-//     directory unwritable, and the encoder emits an empty one. That trades a
-//     rare event for a total loss — one unlucky pair of keys costs the document
-//     every integer key lookup it would have had, silently.
-//   - JSS8 (tolerant=true): the colliding entries are both listed. A reader
-//     that lands on a run of more than one settles it by comparing the pool
-//     strings, which costs a group decode for the run and nothing for every
-//     other key in the document.
-//
-// buildSplitKeyDirectory is the JSS8 (5.3.0-draft) directory: it lists the
-// whole key pool — the directory is complete, and the key pool is exactly the
-// set it lists — with entries of the key width (specification §7A.2).
-func buildSplitKeyDirectory(keys *stringPool, keyWidth int) (out []byte, ok bool) {
-	idx := make([]int, keys.len())
-	for i := range idx {
-		idx[i] = i
-	}
-	return buildKeyDirectory(keys, idx, keyWidth, true)
-}
-
-func buildKeyDirectory(pool *stringPool, keyIdx []int, width int, tolerant bool) (out []byte, ok bool) {
+// buildKeyDirectory lists the whole key pool, sorted by hash and, within a
+// collision run, by index, with entries of the key width (specification §7A.2).
+// Colliding keys are all listed; a reader settles the run against the pool.
+func buildKeyDirectory(keys *stringPool, width int) []byte {
 	type entry struct {
 		hash uint32
 		idx  int
 	}
-	entries := make([]entry, 0, len(keyIdx))
-	strs := pool.strings()
-	for _, i := range keyIdx {
-		if i < 0 || i >= len(strs) {
-			return nil, false
-		}
-		entries = append(entries, entry{hash: keyHash(strs[i]), idx: i})
+	strs := keys.strings()
+	entries := make([]entry, len(strs))
+	for i, k := range strs {
+		entries[i] = entry{hash: keyHash(k), idx: i}
 	}
 	slices.SortFunc(entries, func(a, b entry) int {
 		switch {
@@ -156,25 +127,18 @@ func buildKeyDirectory(pool *stringPool, keyIdx []int, width int, tolerant bool)
 			return a.idx - b.idx
 		}
 	})
-	if !tolerant {
-		for i := 1; i < len(entries); i++ {
-			if entries[i].hash == entries[i-1].hash {
-				return nil, false
-			}
-		}
-	}
 
-	out = make([]byte, 0, 4+len(entries)*(4+width))
+	out := make([]byte, 0, 4+len(entries)*(4+width))
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(entries)))
 	for _, e := range entries {
 		out = binary.LittleEndian.AppendUint32(out, e.hash)
 		out = appendIndex(out, e.idx, width)
 	}
-	return out, true
+	return out
 }
 
-// emptyKeyDirectory is the section a JSS6 encoder writes when it has no
-// directory to offer: a count of zero, and nothing else.
+// emptyKeyDirectory is the section an encoder writes when told to offer no
+// directory: a count of zero, and nothing else (specification §7A.2).
 var emptyKeyDirectory = []byte{0, 0, 0, 0}
 
 // appendIndex writes a pool index in the archive's index width.
@@ -191,7 +155,7 @@ func appendIndex(dst []byte, v, width int) []byte {
 
 // readKeyDirectory parses the section at pos and returns the offset just past
 // it. A count of zero is a valid, empty directory.
-func readKeyDirectory(raw []byte, pos, width, poolCount int, tolerant bool) (keyDirectory, int, error) {
+func readKeyDirectory(raw []byte, pos, width, poolCount int) (keyDirectory, int, error) {
 	var d keyDirectory
 	if pos+4 > len(raw) {
 		return d, 0, errTruncatedf("key directory count")
@@ -225,15 +189,11 @@ func readKeyDirectory(raw []byte, pos, width, poolCount int, tolerant bool) (key
 		if i == 0 {
 			continue
 		}
-		// Sorted, and through JSS7 strictly so: a repeated hash there means the
-		// encoder broke its own collision-free promise. JSS8 permits the repeat
-		// and only requires the order.
+		// Sorted by hash, and a collision run by index (specification §7A.6).
 		prev, cur := d.hashAt(i-1), d.hashAt(i)
 		switch {
 		case cur < prev:
 			return keyDirectory{}, 0, errCorruptf("key directory is not sorted at entry %d", i)
-		case cur == prev && !tolerant:
-			return keyDirectory{}, 0, errCorruptf("key directory repeats hash %#08x at entry %d", cur, i)
 		case cur == prev && d.indexAt(i) <= d.indexAt(i-1):
 			return keyDirectory{}, 0, errCorruptf("key directory collision run is not ordered at entry %d", i)
 		}

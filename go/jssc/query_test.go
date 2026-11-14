@@ -101,7 +101,7 @@ func TestQueryMatchesOJG(t *testing.T) {
 		"$[99].name",
 		"$[*].missing",
 	}
-	for _, layout := range []jssc.Layout{jssc.LayoutDefault, jssc.LayoutLenPrefix, jssc.LayoutOffsets, jssc.LayoutLegacy} {
+	for _, layout := range []jssc.Layout{jssc.LayoutDefault, jssc.LayoutLenPrefix, jssc.LayoutOffsets} {
 		for _, sc := range []jssc.StructCodec{jssc.StructRaw, jssc.StructDeflate} {
 			opt := jssc.Options{Layout: layout, Structure: sc}
 			a, raw := openTestArchive(t, "testdata/users.json", opt)
@@ -112,6 +112,7 @@ func TestQueryMatchesOJG(t *testing.T) {
 			}
 		}
 	}
+
 }
 
 func TestQueryMultiDoc(t *testing.T) {

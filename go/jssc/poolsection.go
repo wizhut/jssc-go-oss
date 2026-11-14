@@ -15,10 +15,8 @@ import (
 // `1 << groupShift` consecutive pool entries and is the unit a reader must
 // decompress to reach any entry inside it.
 //
-// With a group size of 1 — every version through JSS4, and the JSS5 default for
-// codecs that carry their own dictionary — a group is exactly one entry, and
-// the format keeps the original guarantee that decoding entry i touches nothing
-// else. Larger groups let entries share compression context, which is where the
+// With a group size of 1 — the default — a group is exactly one entry, and
+// decoding entry i touches nothing else. Larger groups let entries share compression context, which is where the
 // size comes from: a general compressor over 64 neighbouring strings finds the
 // cross-entry repetition that a per-entry codec structurally cannot.
 //
@@ -26,22 +24,20 @@ import (
 // pool section by 63%. The cost is that a cold read of one string inflates its
 // whole group, which is what a cold query pays.
 //
-// Group framing:
+// Section framing (specification §7.4), after the uint32 pool_len:
 //
-//	JSS1–JSS4   uint32 compressed_len  ‖  bytes        (one entry per group)
-//	JSS5–JSS7   uvarint compressed_len ‖  bytes
-//	JSS8        ceil(groups/8) bytes of stored-raw flags, then
-//	            max(0, ceil(groups/64)-1) uint32 group directory entries, then
-//	            uvarint stored_len ‖ bytes, per group
+//	ceil(groups/8) bytes of stored-raw flags, then
+//	max(0, ceil(groups/64)-1) uint32 group directory entries, then
+//	uvarint stored_len ‖ bytes, per group
 //
-// The JSS8 group directory (5.6.0-draft) gives where every 64th group's length
+// The group directory (5.6.0-draft) gives where every 64th group's length
 // prefix begins, counted from group 0's. Without it the only way to find group
 // g is to read every length ahead of it, so the first string read after an
 // O(1) open walked the whole section; with it a reader walks one segment of at
 // most 64 lengths whatever the pool size, and checks that segment against the
 // boundaries on either side (specification §7.4).
 //
-// The JSS8 flags are the pool's version of the rule the structure codec has
+// The flags are the pool's version of the rule the structure codec has
 // always had: the header describes the bytes that follow, not the bytes the
 // encoder intended. A group whose compressed form is no smaller than its
 // plaintext is stored plain and marked, which on short strings saves both the
@@ -126,10 +122,11 @@ func uvarintLen(v uint64) int {
 // so the output is byte-identical to a sequential encode. Determinism is a
 // normative requirement, not a nicety.
 //
-// directory selects the JSS8 group directory, written between the stored-raw
-// flags and the groups. Every entry is known before a group is written, because
-// each group's framed size is its length's uvarint width plus its length.
-func encodePool(c codec.Codec, entries []string, groupShift uint8, varintFraming, opportunistic, directory bool, concurrency int) (section []byte, payload, rawGroups int, err error) {
+// The section is the stored-raw flags, the group directory and the framed
+// groups (specification §7.4). Every directory entry is known before a group is
+// written, because each group's framed size is its length's uvarint width plus
+// its length.
+func encodePool(c codec.Codec, entries []string, groupShift uint8, concurrency int) (section []byte, payload, rawGroups int, err error) {
 	size := 1 << groupShift
 	groups := groupCount(len(entries), size)
 	if groups == 0 {
@@ -139,81 +136,62 @@ func encodePool(c codec.Codec, entries []string, groupShift uint8, varintFraming
 	blocks := make([][]byte, groups)
 	raw := make([]bool, groups)
 	if concurrency > 1 && worthParallel(entries, groups) {
-		err = encodeGroupsParallel(c, entries, size, blocks, raw, opportunistic, concurrency)
+		err = encodeGroupsParallel(c, entries, size, blocks, raw, concurrency)
 	} else {
-		err = encodeGroupsSequential(c, entries, size, blocks, raw, opportunistic)
+		err = encodeGroupsSequential(c, entries, size, blocks, raw)
 	}
 	if err != nil {
 		return nil, 0, 0, err
 	}
 
-	framedSize := func(enc []byte) int {
-		if varintFraming {
-			return uvarintLen(uint64(len(enc))) + len(enc)
-		}
-		return 4 + len(enc)
-	}
-	flagBytes, dirBytes, framed := 0, 0, 0
-	if opportunistic {
-		flagBytes = rawFlagBytes(groups)
-	}
-	if directory {
-		dirBytes = 4 * dirEntries(groups)
-	}
+	framedSize := func(enc []byte) int { return uvarintLen(uint64(len(enc))) + len(enc) }
+	flagBytes, dirBytes, framed := rawFlagBytes(groups), 4*dirEntries(groups), 0
 	for _, enc := range blocks {
 		framed += framedSize(enc)
 	}
 
 	section = make([]byte, flagBytes, flagBytes+dirBytes+framed)
-	if opportunistic {
-		for g := range blocks {
-			if raw[g] {
-				section[g/8] |= 1 << (g % 8)
-				rawGroups++
-			}
+	for g := range blocks {
+		if raw[g] {
+			section[g/8] |= 1 << (g % 8)
+			rawGroups++
 		}
 	}
-	if directory {
-		off := 0
-		for g, enc := range blocks {
-			if g > 0 && g%segmentGroups == 0 {
-				// An offset past uint32 means a section past pool_len's range,
-				// which framePoolSection refuses; refusing here says why.
-				if off > math.MaxUint32 {
-					return nil, 0, 0, errLimitf("pool group %d starts %d bytes in (group directory max %d)",
-						g, off, uint64(math.MaxUint32))
-				}
-				section = binary.LittleEndian.AppendUint32(section, uint32(off))
+	off := 0
+	for g, enc := range blocks {
+		if g > 0 && g%segmentGroups == 0 {
+			// An offset past uint32 means a section past pool_len's range,
+			// which framePoolSection refuses; refusing here says why.
+			if off > math.MaxUint32 {
+				return nil, 0, 0, errLimitf("pool group %d starts %d bytes in (group directory max %d)",
+					g, off, uint64(math.MaxUint32))
 			}
-			off += framedSize(enc)
+			section = binary.LittleEndian.AppendUint32(section, uint32(off))
 		}
+		off += framedSize(enc)
 	}
 	for _, enc := range blocks {
-		if varintFraming {
-			section = binary.AppendUvarint(section, uint64(len(enc)))
-		} else {
-			section = binary.LittleEndian.AppendUint32(section, uint32(len(enc)))
-		}
+		section = binary.AppendUvarint(section, uint64(len(enc)))
 		section = append(section, enc...)
 		payload += len(enc)
 	}
 	return section, payload, rawGroups, nil
 }
 
-// rawFlagBytes is the size of the JSS8 stored-raw bitmap for a group count.
+// rawFlagBytes is the size of the stored-raw bitmap for a group count.
 func rawFlagBytes(groups int) int { return (groups + 7) / 8 }
 
-// encodeGroup compresses one group, and under the opportunistic rule keeps the
-// plaintext instead when compression did not strictly shrink it.
+// encodeGroup compresses one group, and keeps the plaintext instead when
+// compression did not strictly shrink it (specification §7.5).
 //
 // Strictly: a tie is stored raw, because equal bytes that need no decompression
 // are the better of the two.
-func encodeGroup(c codec.Codec, plain []byte, opportunistic bool) (out []byte, storedRaw bool, err error) {
+func encodeGroup(c codec.Codec, plain []byte) (out []byte, storedRaw bool, err error) {
 	enc, err := c.Encode(plain)
 	if err != nil {
 		return nil, false, err
 	}
-	if opportunistic && len(enc) >= len(plain) {
+	if len(enc) >= len(plain) {
 		return plain, true, nil
 	}
 	return enc, false, nil
@@ -243,10 +221,10 @@ func worthParallel(entries []string, groups int) bool {
 	return false
 }
 
-func encodeGroupsSequential(c codec.Codec, entries []string, size int, blocks [][]byte, raw []bool, opportunistic bool) error {
+func encodeGroupsSequential(c codec.Codec, entries []string, size int, blocks [][]byte, raw []bool) error {
 	for g := range blocks {
 		lo, hi := groupRange(g, size, len(entries))
-		enc, storedRaw, err := encodeGroup(c, groupPlaintext(entries[lo:hi]), opportunistic)
+		enc, storedRaw, err := encodeGroup(c, groupPlaintext(entries[lo:hi]))
 		if err != nil {
 			return errInvalidf("compress pool group %d: %v", g, err)
 		}
@@ -257,7 +235,7 @@ func encodeGroupsSequential(c codec.Codec, entries []string, size int, blocks []
 
 // encodeGroupsParallel compresses groups across workers. Codec.Encode must be
 // safe for concurrent use; every registered codec is.
-func encodeGroupsParallel(c codec.Codec, entries []string, size int, blocks [][]byte, raw []bool, opportunistic bool, workers int) error {
+func encodeGroupsParallel(c codec.Codec, entries []string, size int, blocks [][]byte, raw []bool, workers int) error {
 	if workers > len(blocks) {
 		workers = len(blocks)
 	}
@@ -278,7 +256,7 @@ func encodeGroupsParallel(c codec.Codec, entries []string, size int, blocks [][]
 					return
 				}
 				lo, hi := groupRange(g, size, len(entries))
-				enc, storedRaw, err := encodeGroup(c, groupPlaintext(entries[lo:hi]), opportunistic)
+				enc, storedRaw, err := encodeGroup(c, groupPlaintext(entries[lo:hi]))
 				if err != nil {
 					mu.Lock()
 					if firstErr == nil {
@@ -298,73 +276,6 @@ func encodeGroupsParallel(c codec.Codec, entries []string, size int, blocks [][]
 	return firstErr
 }
 
-// walkPoolSection walks the group framing, reading only lengths, and reports
-// where each group sits. It allocates nothing of its own; fn may be nil, which
-// is how a caller that only needs the section's extent asks for it.
-//
-// Opening a JSS1–JSS7 archive uses the nil form: those versions store no
-// section length, so open has to walk the framing to find what follows it.
-// JSS8 opens without walking anything (specification §7.4).
-func walkPoolSection(raw []byte, pos, poolCount, groupSize int, varintFraming, opportunistic bool,
-	fn func(g, off, n int, storedRaw bool)) (end, payload int, err error) {
-
-	groups := groupCount(poolCount, groupSize)
-
-	// A group costs at least one framing byte, so a count that cannot fit in
-	// the remaining buffer is corrupt however the rest is framed.
-	if int64(groups) > int64(len(raw)-pos) {
-		return 0, 0, errCorruptf("archive declares %d pool groups but has %d bytes left",
-			groups, len(raw)-pos)
-	}
-
-	start := pos
-	flags := 0
-	if opportunistic {
-		flags = rawFlagBytes(groups)
-		if flags > len(raw)-pos {
-			return 0, 0, errTruncatedf("pool stored-raw flags")
-		}
-		pos += flags
-	}
-	for g := range groups {
-		var n int
-		if varintFraming {
-			v, size, err := readUvarintBytes(raw, pos)
-			if err != nil {
-				return 0, 0, errTruncatedf("pool group %d length", g)
-			}
-			pos += size
-			n = int(v)
-		} else {
-			if pos+4 > len(raw) {
-				return 0, 0, errTruncatedf("pool group %d length", g)
-			}
-			n = int(binary.LittleEndian.Uint32(raw[pos:]))
-			pos += 4
-		}
-		// pos+n must not be evaluated before it is known to fit: a group length
-		// near MaxInt overflows the addition to a negative, which then passes a
-		// naive bounds check and slices with a huge negative index. Compare
-		// against the room remaining instead, which cannot overflow.
-		if n < 0 || pos < 0 || pos > len(raw) || n > len(raw)-pos {
-			return 0, 0, errTruncatedf("pool group %d payload", g)
-		}
-		if fn != nil {
-			storedRaw := opportunistic && raw[start+g/8]&(1<<(g%8)) != 0
-			fn(g, pos-start, n, storedRaw)
-		}
-		payload += n
-		pos += n
-	}
-	return pos, payload, nil
-}
-
-// scanPoolSection validates the framing and returns the section's end and its
-// stored payload, without building an index or allocating.
-func scanPoolSection(raw []byte, pos, poolCount, groupSize int, varintFraming, opportunistic bool) (end, payload int, err error) {
-	return walkPoolSection(raw, pos, poolCount, groupSize, varintFraming, opportunistic, nil)
-}
-
 // poolReader reads one pool section lazily, a segment of groups at a time.
 //
 // Opening records where the section's parts are and reads none of them. The
@@ -372,26 +283,21 @@ func scanPoolSection(raw []byte, pos, poolCount, groupSize int, varintFraming, o
 // walked the first time a group inside it is wanted, checked against the
 // boundaries on either side, and its entries are cached as they are decoded.
 //
-// A JSS8 archive stores those boundaries in its group directory, so the first
-// read costs one segment whatever the size of the pool. Earlier versions store
-// none: there the first read walks every length once to find them — the cost
-// the directory exists to remove — and reads the same way afterwards.
+// The section stores those boundaries in its group directory, so the first read
+// costs one segment whatever the size of the pool (specification §7.4).
 type poolReader struct {
-	name          string // "pool" or "key pool", for errors
-	raw           []byte // the whole archive
-	count         int    // entries
-	groupSize     int
-	groups        int
-	varint        bool
-	opportunistic bool
-	flags         int // absolute offset of the stored-raw bitmap
-	dir           int // absolute offset of the group directory; -1 when the version has none
-	framed        int // absolute offset of group 0's length prefix
-	end           int // absolute end of the framed groups
+	name      string // "pool" or "key pool", for errors
+	raw       []byte // the whole archive
+	count     int    // entries
+	groupSize int
+	groups    int
+	flags     int // absolute offset of the stored-raw bitmap
+	dir       int // absolute offset of the group directory
+	framed    int // absolute offset of group 0's length prefix
+	end       int // absolute end of the framed groups
 
-	ready  bool
-	bounds []int          // segment starts found by one walk, when there is no directory
-	segs   []*poolSegment // segs[k] stays nil until segment k has been walked
+	ready bool
+	segs  []*poolSegment // segs[k] stays nil until segment k has been walked
 }
 
 // poolSegment is one walked segment: where its groups are, and the entries
@@ -407,32 +313,21 @@ type poolSegment struct {
 	inline [segmentGroups]string // strs when a group is one entry
 }
 
-// newPoolReader lays out a pool section that occupies raw[start:end] after any
+// newPoolReader lays out a pool section that occupies raw[start:end] after its
 // length prefix, without reading a single group.
 //
 // The bitmap and the directory are sized by the group count alone, and every
 // group costs at least one framing byte, so a count the section cannot hold is
 // rejected here, before it sizes anything (specification §7.4).
-func newPoolReader(name string, raw []byte, start, end, count, groupSize int,
-	varint, opportunistic, directory bool) (*poolReader, error) {
-
+func newPoolReader(name string, raw []byte, start, end, count, groupSize int) (*poolReader, error) {
 	groups := groupCount(count, groupSize)
 	p := &poolReader{
 		name: name, raw: raw, count: count, groupSize: groupSize, groups: groups,
-		varint: varint, opportunistic: opportunistic,
-		flags: start, dir: -1, end: end,
+		flags: start, end: end,
 	}
-	need := int64(groups)
-	pos := start
-	if opportunistic {
-		need += int64(rawFlagBytes(groups))
-		pos += rawFlagBytes(groups)
-	}
-	if directory {
-		need += 4 * int64(dirEntries(groups))
-		p.dir = pos
-		pos += 4 * dirEntries(groups)
-	}
+	need := int64(groups) + int64(rawFlagBytes(groups)) + 4*int64(dirEntries(groups))
+	p.dir = start + rawFlagBytes(groups)
+	pos := p.dir + 4*dirEntries(groups)
 	if need > int64(end-start) {
 		return nil, errCorruptf("%s: %d groups need at least %d bytes, the section has %d",
 			name, groups, need, end-start)
@@ -441,32 +336,12 @@ func newPoolReader(name string, raw []byte, start, end, count, groupSize int,
 	return p, nil
 }
 
-// prepare allocates the segment table, once, on the first string read. With no
-// directory it also walks every length to find where the segments start, and
-// checks the walk ends where the section does.
+// prepare allocates the segment table, once, on the first string read.
 func (p *poolReader) prepare() error {
 	if p.ready {
 		return nil
 	}
-	nseg := segmentCount(p.groups)
-	if p.dir < 0 && nseg > 1 {
-		p.bounds = make([]int, nseg)
-		pos := p.framed
-		for g := range p.groups {
-			if g%segmentGroups == 0 {
-				p.bounds[g/segmentGroups] = pos
-			}
-			start, n, err := p.frameAt(pos, p.end, g)
-			if err != nil {
-				return err
-			}
-			pos = start + n
-		}
-		if pos != p.end {
-			return errCorruptf("%s groups end at %d, the section ends at %d", p.name, pos, p.end)
-		}
-	}
-	p.segs = make([]*poolSegment, nseg)
+	p.segs = make([]*poolSegment, segmentCount(p.groups))
 	p.ready = true
 	return nil
 }
@@ -480,10 +355,8 @@ func (p *poolReader) boundary(k int) int64 {
 		return int64(p.framed)
 	case k == len(p.segs):
 		return int64(p.end)
-	case p.dir >= 0:
-		return int64(p.framed) + int64(binary.LittleEndian.Uint32(p.raw[p.dir+4*(k-1):]))
 	default:
-		return int64(p.bounds[k])
+		return int64(p.framed) + int64(binary.LittleEndian.Uint32(p.raw[p.dir+4*(k-1):]))
 	}
 }
 
@@ -492,26 +365,15 @@ func (p *poolReader) boundary(k int) int64 {
 // pos+n is never formed before n is known to fit: a length near MaxInt would
 // overflow it to a negative that passes a naive bounds check.
 func (p *poolReader) frameAt(pos, limit, g int) (start, n int, err error) {
-	if p.varint {
-		v, size, err := readUvarintBytes(p.raw[:limit], pos)
-		if err != nil {
-			return 0, 0, errTruncatedf("%s group %d length", p.name, g)
-		}
-		pos += size
-		if v > uint64(limit-pos) {
-			return 0, 0, errTruncatedf("%s group %d payload", p.name, g)
-		}
-		return pos, int(v), nil
-	}
-	if pos < 0 || limit-pos < 4 {
+	v, size, err := readUvarintBytes(p.raw[:limit], pos)
+	if err != nil {
 		return 0, 0, errTruncatedf("%s group %d length", p.name, g)
 	}
-	n = int(binary.LittleEndian.Uint32(p.raw[pos:]))
-	pos += 4
-	if n > limit-pos {
+	pos += size
+	if v > uint64(limit-pos) {
 		return 0, 0, errTruncatedf("%s group %d payload", p.name, g)
 	}
-	return pos, n, nil
+	return pos, int(v), nil
 }
 
 // segment returns segment k, walking its lengths on first use. The walk is
@@ -527,8 +389,8 @@ func (p *poolReader) segment(k int) (*poolSegment, error) {
 		return nil, errCorruptf("%s segment %d spans [%d, %d), outside [%d, %d)",
 			p.name, k, lo, hi, p.framed, p.end)
 	}
-	// A JSS8 segment lies inside a pool_len-bounded section and always fits;
-	// only an earlier version's sixty-four uint32-framed groups could not.
+	// A segment lies inside a pool_len-bounded section and always fits; the
+	// check keeps the uint32 offsets below honest on any platform.
 	if hi-lo > math.MaxUint32 {
 		return nil, errLimitf("%s segment %d spans %d bytes, past what this reader indexes",
 			p.name, k, hi-lo)
@@ -562,7 +424,7 @@ func (p *poolReader) segment(k int) (*poolSegment, error) {
 // storedRaw reports whether group g holds its plaintext rather than a
 // compressed form, in which case the pool codec must not be applied to it.
 func (p *poolReader) storedRaw(g int) bool {
-	return p.opportunistic && p.raw[p.flags+g/8]&(1<<(g%8)) != 0
+	return p.raw[p.flags+g/8]&(1<<(g%8)) != 0
 }
 
 // stored returns the stored bytes of group g, which lives in segment s. The
@@ -570,12 +432,8 @@ func (p *poolReader) storedRaw(g int) bool {
 // was walked, so it cannot run past it now.
 func (p *poolReader) stored(s *poolSegment, g int) []byte {
 	pos := s.base + int(s.at[g%segmentGroups])
-	if p.varint {
-		n, w := binary.Uvarint(p.raw[pos:])
-		return p.raw[pos+w : pos+w+int(n)]
-	}
-	n := int(binary.LittleEndian.Uint32(p.raw[pos:]))
-	return p.raw[pos+4 : pos+4+n]
+	n, w := binary.Uvarint(p.raw[pos:])
+	return p.raw[pos+w : pos+w+int(n)]
 }
 
 // cached reports whether group g of segment s has been decoded.

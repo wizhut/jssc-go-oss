@@ -2,7 +2,6 @@ package jssc
 
 import (
 	"bytes"
-	"compress/flate"
 	"encoding/binary"
 	"encoding/json"
 	"io"
@@ -14,12 +13,11 @@ import (
 // strings stay compressed until something asks for them, and the structure can
 // be walked without materializing the JSON tree.
 //
-// The structure block is inflated once at open time when the archive uses
-// StructDeflate — DEFLATE is not randomly seekable. The pool is never decoded
-// up front.
+// Opening inflates nothing: a structure block is inflated the first time a read
+// lands inside it, and the pool is never decoded up front.
 //
-// Multi-document archives (JSS4, JSONL/NDJSON) expose DocCount documents over
-// one shared pool; JSONPath treats them as a virtual root array.
+// Multi-document archives (JSONL/NDJSON) expose DocCount documents over one
+// shared pool; JSONPath treats them as a virtual root array.
 //
 // An Archive is not safe for concurrent use: reads populate the pool cache and
 // the child-offset caches.
@@ -33,7 +31,6 @@ type Archive struct {
 
 	contentFmt ContentFormat
 	docCount   int
-	docOff     []int // structure offset of each document root
 
 	// vals reads the value pool a segment at a time; groupSize is how many
 	// entries each group holds. Decoding one entry decompresses its whole
@@ -55,35 +52,30 @@ type Archive struct {
 	// codecAppender is a.codec when it can decode into a caller's buffer.
 	codecAppender codec.Appender
 
-	// The key pool (JSS8, 5.3.0-draft): its own section, index space, and
-	// width. Before the split keys is vals, so key indices and pool indices
-	// coincide exactly as the old layout defined.
-	split    bool
+	// The key pool: its own section, index space, and width (specification
+	// §7).
 	keyCount int
 	keyWidth int
 	keys     *poolReader
 
-	// paths is the JSS8 key-path filter, when the archive carries one. Its only
+	// paths is the key-path filter, when the archive carries one. Its only
 	// answer that means anything is "no": a path it rejects is not in the
 	// document, and a path it accepts still has to be walked for.
 	paths pathFilter
 
-	// keyDir is the JSS6 key hash directory: hash of key to pool index, for
+	// keyDir is the key hash directory: hash of key to key-pool index, for
 	// every string the document uses as an object key. When it is present a
 	// field lookup resolves its key to an integer without decompressing any
 	// pool group, and a key that is absent from it is absent from the document.
 	keyDir keyDirectory
 
-	// structure addresses the structure by plain offset. Through JSS6 it wraps
-	// one inflated block; a JSS7 archive inflates blocks on demand, so opening
-	// costs nothing and reading one document costs one block.
+	// structure addresses the structure by plain offset, inflating blocks on
+	// demand, so opening costs nothing and reading one document costs one
+	// block.
 	structure *structBlocks
 
 	lenPrefix     bool
 	layoutOffsets bool
-	// adaptiveOffsets is set for JSS5, where each container states its offset
-	// table width instead of the reader inferring it from the child count.
-	adaptiveOffsets bool
 
 	// childOff maps a container's value start to its children's value starts;
 	// childKeyOff does the same for object member keys.
@@ -102,9 +94,6 @@ type Archive struct {
 	// FilteredOut records that the last query returned nothing because the
 	// key-path filter rejected its path, so no walk was attempted at all.
 	FilteredOut bool
-
-	// rootOffsets is set for JSS7, where the root table holds absolute offsets.
-	rootOffsets bool
 
 	// matchLimit caps how many matches a query collects; 0 means unlimited.
 	matchLimit int
@@ -151,8 +140,6 @@ func OpenBytesWith(raw []byte, lim Limits) (*Archive, error) {
 		docCount:      int(h.docCount),
 		lenPrefix:     h.layout&LayoutLenPrefix != 0,
 		layoutOffsets: h.layout&LayoutOffsets != 0,
-
-		adaptiveOffsets: h.adaptiveOffsets(),
 	}
 
 	c, err := codec.NewByID(h.algo)
@@ -171,46 +158,26 @@ func OpenBytesWith(raw []byte, lim Limits) (*Archive, error) {
 	// archive can answer at open.
 	a.codecAppender, _ = c.(codec.Appender)
 
-	a.split = h.splitPools()
+	// The key pool section precedes the value pool section, each declaring its
+	// own length, so open locates both without reading a group (specification
+	// §7.4).
 	a.keyWidth = h.keyWidth()
 	a.keyCount = int(h.keyCount)
-	keyPoolBytes := 0
-	if a.split {
-		// The key pool section precedes the value pool section, each declaring
-		// its own length (specification §7).
-		if pos+4 > len(raw) {
-			return nil, errTruncatedf("key pool section length")
-		}
-		klen := int(binary.LittleEndian.Uint32(raw[pos:]))
-		pos += 4
-		if klen > len(raw)-pos {
-			return nil, errTruncatedf("key pool section: %d bytes declared, %d available", klen, len(raw)-pos)
-		}
-		a.keys, err = newPoolReader("key pool", raw, pos, pos+klen, a.keyCount, h.groupSize(),
-			h.varintPool(), h.opportunisticPool(), h.groupDirectory())
-		if err != nil {
-			return nil, err
-		}
-		keyPoolBytes = 4 + klen
-		pos += klen
-	}
-
-	poolBytes, pos, err := a.indexPool(raw, pos, h)
+	a.groupSize = h.groupSize()
+	var klen, poolBytes int
+	a.keys, klen, pos, err = openPoolSection("key pool", raw, pos, a.keyCount, a.groupSize)
 	if err != nil {
 		return nil, err
 	}
-	if !a.split {
-		// One pool, one index space: the key side is the value side, so key
-		// indices are pool indices, which is what the pre-split layouts encode.
-		a.keyCount = a.poolCount
-		a.keys = a.vals
+	keyPoolBytes := 4 + klen
+	a.vals, poolBytes, pos, err = openPoolSection("pool", raw, pos, a.poolCount, a.groupSize)
+	if err != nil {
+		return nil, err
 	}
 
-	if h.keyDir() {
-		a.keyDir, pos, err = readKeyDirectory(raw, pos, a.keyWidth, a.keyCount, h.completeKeyDirectory())
-		if err != nil {
-			return nil, err
-		}
+	a.keyDir, pos, err = readKeyDirectory(raw, pos, a.keyWidth, a.keyCount)
+	if err != nil {
+		return nil, err
 	}
 
 	if h.pathFilter() {
@@ -228,26 +195,12 @@ func OpenBytesWith(raw []byte, lim Limits) (*Archive, error) {
 	if storedLen < 0 || pos > len(raw) || storedLen > len(raw)-pos {
 		return nil, errTruncatedf("structure: %d bytes declared, %d available", storedLen, len(raw)-pos)
 	}
-	if h.blockedStructure() {
-		a.structure, err = newStructBlocks(raw[pos:pos+storedLen], h.structCodec, lim.MaxPlainStructure)
-	} else {
-		var plain []byte
-		plain, err = unpackStructure(raw[pos:pos+storedLen], h.structCodec, lim.MaxPlainStructure)
-		if err == nil {
-			a.structure = newSingleBlock(plain)
-		}
-	}
+	a.structure, err = newStructBlocks(raw[pos:pos+storedLen], h.structCodec, lim.MaxPlainStructure)
 	if err != nil {
 		return nil, err
 	}
-	a.rootOffsets = h.rootOffsets()
-
-	if h.version >= 4 {
-		if err := a.indexDocs(); err != nil {
-			return nil, err
-		}
-	} else {
-		a.docOff = []int{0}
+	if int64(a.docCount)*4 > int64(a.structure.len()) {
+		return nil, errTruncatedf("root offset table")
 	}
 
 	a.stats = Stats{
@@ -255,7 +208,7 @@ func OpenBytesWith(raw []byte, lim Limits) (*Archive, error) {
 		StructCodec:   h.structCodec,
 		StructLayout:  h.layout,
 		ContentFormat: a.contentFmt,
-		Version:       h.version,
+		Version:       LatestVersion,
 		DocCount:      a.docCount,
 		IndexWidth:    a.indexWidth,
 		UniqueStrings: a.poolCount,
@@ -265,101 +218,43 @@ func OpenBytesWith(raw []byte, lim Limits) (*Archive, error) {
 		HeaderBytes:   h.size(),
 		StateBytes:    stateBytes,
 		KeyDirEntries: a.keyDir.len(),
-	}
-	if h.keyDir() {
-		a.stats.KeyDirBytes = 4 + a.keyDir.len()*(4+a.keyWidth)
-	}
-	if a.split {
-		a.stats.KeyWidth = a.keyWidth
-		a.stats.DistinctKeys = a.keyCount
-		a.stats.KeyPoolBytes = keyPoolBytes
+		KeyDirBytes:   4 + a.keyDir.len()*(4+a.keyWidth),
+		KeyWidth:      a.keyWidth,
+		DistinctKeys:  a.keyCount,
+		KeyPoolBytes:  keyPoolBytes,
 	}
 	return a, nil
 }
 
-// indexPool prepares pool access without doing any of it.
+// openPoolSection lays out the pool section at pos without doing any of it,
+// and returns its reader, its declared length and the offset past it.
 //
 // Opening notes where the section's parts are and stops there: no group index,
 // no entry cache. On a query that returns a number, an inline string, or
 // nothing at all — a rejected path, an absent key — none of those allocations
 // are ever made, and that is the common case for a field lookup. The pool
 // reader builds them a segment at a time as strings are actually wanted.
-func (a *Archive) indexPool(raw []byte, pos int, h header) (poolBytes, next int, err error) {
-	a.groupSize = h.groupSize()
-
-	// From JSS8 the section declares its own stored length, so open finds the
-	// key directory in O(1), and the group directory lets the first read walk
-	// one segment rather than the section (specification §7.4). PoolBytes on
-	// open is the declared section length — framing included — since the
-	// payload split is not known until the framing is walked.
-	if h.poolSectionLength() {
-		if pos+4 > len(raw) {
-			return 0, 0, errTruncatedf("pool section length")
-		}
-		plen := int(binary.LittleEndian.Uint32(raw[pos:]))
-		pos += 4
-		if plen > len(raw)-pos {
-			return 0, 0, errTruncatedf("pool section: %d bytes declared, %d available", plen, len(raw)-pos)
-		}
-		a.vals, err = newPoolReader("pool", raw, pos, pos+plen, a.poolCount, a.groupSize,
-			h.varintPool(), h.opportunisticPool(), h.groupDirectory())
-		if err != nil {
-			return 0, 0, err
-		}
-		return plen, pos + plen, nil
+// PoolBytes on open is the declared section length, framing included.
+func openPoolSection(name string, raw []byte, pos, count, groupSize int) (*poolReader, int, int, error) {
+	if pos+4 > len(raw) {
+		return nil, 0, 0, errTruncatedf("%s section length", name)
 	}
-
-	next, poolBytes, err = scanPoolSection(raw, pos, a.poolCount, a.groupSize,
-		h.varintPool(), h.opportunisticPool())
+	n := int(binary.LittleEndian.Uint32(raw[pos:]))
+	pos += 4
+	if n > len(raw)-pos {
+		return nil, 0, 0, errTruncatedf("%s section: %d bytes declared, %d available", name, n, len(raw)-pos)
+	}
+	p, err := newPoolReader(name, raw, pos, pos+n, count, groupSize)
 	if err != nil {
-		return 0, 0, err
+		return nil, 0, 0, err
 	}
-	a.vals, err = newPoolReader("pool", raw, pos, next, a.poolCount, a.groupSize,
-		h.varintPool(), h.opportunisticPool(), false)
-	if err != nil {
-		return 0, 0, err
-	}
-	return poolBytes, next, nil
-}
-
-// indexDocs prepares document lookup.
-//
-// Through JSS6 the root table holds lengths, so every offset is a prefix sum and
-// the whole table has to be walked at open: O(N) time and an int per document,
-// which at a million rows is eight megabytes before anything is read. JSS7
-// stores absolute offsets instead, so document i is one read of four bytes and
-// opening does nothing at all.
-func (a *Archive) indexDocs() error {
-	base := int64(a.docCount) * 4
-	if base > int64(a.structure.len()) {
-		return errTruncatedf("multi-document length table")
-	}
-	if a.rootOffsets {
-		return nil
-	}
-	a.docOff = make([]int, a.docCount)
-	pos := base
-	for i := range a.docCount {
-		n, err := a.structure.u32(i * 4)
-		if err != nil {
-			return errTruncatedf("multi-document length table")
-		}
-		a.docOff[i] = int(pos)
-		pos += int64(n)
-		if pos > int64(a.structure.len()) {
-			return errTruncatedf("document %d root", i)
-		}
-	}
-	return nil
+	return p, n, pos + n, nil
 }
 
 // docStart returns the plain offset of document i's root.
 func (a *Archive) docStart(i int) (int, error) {
 	if i < 0 || i >= a.docCount {
 		return 0, errCorruptf("document %d out of range [0,%d)", i, a.docCount)
-	}
-	if !a.rootOffsets {
-		return a.docOff[i], nil
 	}
 	off, err := a.structure.u32(i * 4)
 	if err != nil {
@@ -369,32 +264,6 @@ func (a *Archive) docStart(i int) (int, error) {
 		return 0, errCorruptf("document %d starts at %d, outside the structure", i, off)
 	}
 	return int(off), nil
-}
-
-// unpackStructure reverses packStructure. maxPlain, when positive, bounds how
-// far a deflated block is allowed to expand (specification §15.1).
-func unpackStructure(stored []byte, sc StructCodec, maxPlain int64) ([]byte, error) {
-	switch sc {
-	case StructRaw:
-		return stored, nil
-	case StructDeflate:
-		zr := flate.NewReader(bytes.NewReader(stored))
-		defer zr.Close()
-		var r io.Reader = zr
-		if maxPlain > 0 {
-			r = io.LimitReader(zr, maxPlain+1)
-		}
-		out, err := io.ReadAll(r)
-		if err != nil {
-			return nil, errCorruptf("inflate structure: %v", err)
-		}
-		if maxPlain > 0 && int64(len(out)) > maxPlain {
-			return nil, errLimitf("structure inflates past %d bytes", maxPlain)
-		}
-		return out, nil
-	default:
-		return nil, errUnsupportedf("structure codec %d", uint8(sc))
-	}
 }
 
 // DocCount returns the number of top-level documents: 1 for JSON, N for
@@ -494,7 +363,7 @@ func (a *Archive) decodeGroup(p *poolReader, s *poolSegment, g int) error {
 // LookupIndex resolves a string to its pool index without decoding the pool if
 // it can avoid it.
 //
-// With a JSS6 key hash directory and a string that is used as an object key,
+// With a key hash directory and a string that is used as an object key,
 // this decompresses nothing at all: the hash is computed, the directory is
 // searched, and the answer is exact in both directions — a miss means the string
 // is not a key anywhere in the document.
@@ -504,13 +373,6 @@ func (a *Archive) decodeGroup(p *poolReader, s *poolSegment, g int) error {
 func (a *Archive) LookupIndex(s string) (int, bool, error) {
 	if i, ok := a.knownPoolIndex(s); ok {
 		return i, true, nil
-	}
-	if !a.split {
-		// One index space: a directory hit is a pool index. After the split
-		// the directory speaks the key space and cannot answer for a value.
-		if i, ok := a.keyDir.lookup(keyHash(s)); ok {
-			return i, true, nil
-		}
 	}
 	if _, missing := a.poolMisses[s]; missing {
 		return 0, false, nil
@@ -545,10 +407,7 @@ func (a *Archive) LookupKeyIndex(s string) (int, bool) {
 // costs log2(groups)+1 decompressions the first time.
 func (a *Archive) lookupFieldIndex(key string) (int, bool, error) {
 	if !a.hasKeyDir() {
-		if a.split {
-			return a.searchKeyPool(key)
-		}
-		return a.LookupIndex(key)
+		return a.searchKeyPool(key)
 	}
 	lo, hi := a.keyDir.candidates(keyHash(key))
 	switch {
@@ -816,7 +675,7 @@ func (a *Archive) readTagged(pos, limit, depth int) (any, int, error) {
 		return s, next, nil
 
 	case tagArray:
-		count, childStart, err := readContainerCount(a.structure, pos, limit, a.layoutOffsets, a.adaptiveOffsets)
+		count, childStart, err := readContainerCount(a.structure, pos, limit, a.layoutOffsets)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -833,7 +692,7 @@ func (a *Archive) readTagged(pos, limit, depth int) (any, int, error) {
 		return arr, pos, nil
 
 	case tagObject:
-		count, childStart, err := readContainerCount(a.structure, pos, limit, a.layoutOffsets, a.adaptiveOffsets)
+		count, childStart, err := readContainerCount(a.structure, pos, limit, a.layoutOffsets)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -879,8 +738,7 @@ func (a *Archive) readTagged(pos, limit, depth int) (any, int, error) {
 // ---------------------------------------------------------------- key pool --
 //
 // The key pool is read by the same poolReader as the value pool (keyString,
-// above). Before the split (JSS1–JSS7) the two sides are one reader over one
-// section, and either accessor answers with the same bytes.
+// above), over its own section and index space (specification §7).
 
 // searchKeyPool binary searches the sorted key pool, for archives written
 // without a key directory. Keys are always pooled, so a miss is proof.

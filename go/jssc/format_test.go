@@ -58,68 +58,22 @@ func TestHeaderJSS8(t *testing.T) {
 	}
 }
 
-// TestHeaderLegacyVersions checks that the older container and pool encodings
-// are still reachable, since they are what an older decoder can read.
-func TestHeaderLegacyVersions(t *testing.T) {
-	users, err := os.ReadFile("testdata/users.json")
-	if err != nil {
-		t.Fatal(err)
+// TestOpenRefusesEarlierVersions: this package reads JSS8 alone. An archive of
+// one of the draft versions JSS1–JSS7 (specification Appendix E) is recognised
+// as an archive, so a caller routes it to Open, and refused as unsupported
+// rather than misread.
+func TestOpenRefusesEarlierVersions(t *testing.T) {
+	archive, _ := encode(t, []byte(`{"a":"xyzzy"}`), jssc.Options{})
+	for v := 1; v <= 7; v++ {
+		old := append([]byte(nil), archive...)
+		old[3] = byte('0' + v)
+		if !jssc.IsArchive(old) {
+			t.Errorf("JSS%d: IsArchive = false", v)
+		}
+		if _, err := jssc.OpenBytes(old); !errors.Is(err, jssc.ErrUnsupported) {
+			t.Errorf("JSS%d: OpenBytes error = %v, want ErrUnsupported", v, err)
+		}
 	}
-	events, err := os.ReadFile("testdata/events.ndjson")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cases := []struct {
-		name       string
-		raw        []byte
-		opt        jssc.Options
-		wantMagic  string
-		wantHeader int
-	}{
-		{"jss3", users, jssc.Options{Legacy4: true, Algorithm: "fsst"}, jssc.MagicV3, 12},
-		{"jss4", events, jssc.Options{Legacy4: true, Algorithm: "fsst", Format: jssc.FormatNDJSON}, jssc.MagicV4, 17},
-		{"jss2", users, jssc.Options{Layout: jssc.LayoutLegacy, Algorithm: "fsst"}, jssc.MagicV2, 11},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			archive, st := encode(t, tc.raw, tc.opt)
-			if got := string(archive[:4]); got != tc.wantMagic {
-				t.Errorf("magic = %q, want %q", got, tc.wantMagic)
-			}
-			if st.HeaderBytes != tc.wantHeader {
-				t.Errorf("HeaderBytes = %d, want %d", st.HeaderBytes, tc.wantHeader)
-			}
-			if st.PoolGroupSize != 1 {
-				t.Errorf("PoolGroupSize = %d; versions before JSS5 frame one entry per group", st.PoolGroupSize)
-			}
-			text := decode(t, archive)
-			if tc.opt.Format.LineOriented() {
-				return // compared line by line elsewhere
-			}
-			jsonEqual(t, tc.raw, text)
-		})
-	}
-}
-
-func TestHeaderJSS2Legacy(t *testing.T) {
-	raw, err := os.ReadFile("testdata/users.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	archive, st := encode(t, raw, jssc.Options{Layout: jssc.LayoutLegacy, Algorithm: "fsst"})
-
-	if got := string(archive[:4]); got != jssc.MagicV2 {
-		t.Fatalf("magic = %q, want %q", got, jssc.MagicV2)
-	}
-	if st.HeaderBytes != 11 {
-		t.Errorf("HeaderBytes = %d, want 11", st.HeaderBytes)
-	}
-	// JSS2 has no struct_layout byte, so the archive carries no walk aids.
-	if st.StructLayout != 0 {
-		t.Errorf("StructLayout = 0x%02x, want 0 for JSS2", uint8(st.StructLayout))
-	}
-	jsonEqual(t, raw, decode(t, archive))
 }
 
 func TestIndexWidthGrowsWithPool(t *testing.T) {
@@ -250,12 +204,6 @@ func TestOffsetTablesEarnTheirBytes(t *testing.T) {
 		t.Errorf("offset entries cost %d bytes each; the span needs at most 2", perEntry)
 	}
 
-	// Legacy versions keep the old flat rule.
-	_, st = encode(t, small.Bytes(), jssc.Options{Structure: jssc.StructRaw, Legacy4: true})
-	if st.OffsetTables != 4*32 {
-		t.Errorf("JSS4 offset tables = %d bytes, want %d; the old rule is count alone",
-			st.OffsetTables, 4*32)
-	}
 }
 
 func TestDeflateFallsBackToRaw(t *testing.T) {

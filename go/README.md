@@ -89,7 +89,6 @@ arbitrary bytes fail cleanly rather than panic, hang or over-allocate.
 | Path | Role |
 |------|------|
 | `jssc/` | the format: header, pools, key directory, path filter, structure blocks, encode, decode, selective query |
-| `jssc/testdata/golden/` | archives of earlier versions, some written by a separate implementation |
 | `codec/` | the pool codec registry (`fsst`) |
 | `fsst/` | Fast Static Symbol Table, the short-string codec |
 | `sdk/` | the supported API |
@@ -143,9 +142,7 @@ make fuzz-open   # decoder: arbitrary bytes must fail cleanly
 ```
 
 `jssc/spec_example_test.go` holds the encoder to the worked example of the
-specification (Appendix B) byte for byte. `jssc/golden_test.go` decodes archives
-of earlier format versions, several written by a separate implementation, and
-re-encodes their sources. Past fuzzer findings are kept as
+specification (Appendix B) byte for byte. Past fuzzer findings are kept as
 regression inputs (in `jssc/testdata/fuzz/`).
 
 ## Codecs
