@@ -1,0 +1,9 @@
+# Build output
+go/bin/
+go/coverage.out
+
+# Archives written by local runs; the golden fixtures are kept.
+*.jssc
+!go/jssc/testdata/golden/*.jssc
+
+.DS_Store
